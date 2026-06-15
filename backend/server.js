@@ -38,7 +38,7 @@ const CHECKLISTS = {
 const sessions = new Map();
 
 function resetSession(userId) {
-  sessions.set(userId, { step: "idle", data: {}, media: [], mediaHintShown: false });
+  sessions.set(userId, { step: "idle", data: {}, media: [], mediaHintShown: false, submitting: false });
   return sessions.get(userId);
 }
 
@@ -106,47 +106,84 @@ const mediaKeyboard = {
     [{ text: "❌ Отменить", callback_data: "cancel" }],
   ],
 };
+const confirmKeyboard = {
+  inline_keyboard: [
+    [{ text: "✅ Подтвердить и отправить", callback_data: "confirm_send" }],
+    [{ text: "➕ Добавить ещё файлы", callback_data: "add_more" }],
+    [{ text: "❌ Отменить", callback_data: "cancel" }],
+  ],
+};
 
 function reportTypeLabel(type) {
   return type === "final" ? "Заключительный" : "Предварительный";
 }
 
+const MEDIA_PROMPT =
+  "Теперь пришлите все фото и видео — по одному или альбомом.\nКогда закончите — нажмите «Отправить отчёт».";
+
 // ===== Старт нового отчёта =====
 async function startReport(chatId, userId) {
   resetSession(userId);
   getSession(userId).step = "type";
-  await sendMessage(
-    chatId,
-    "Здравствуйте! Создаём фотоотчёт о выезде.\n\nВыберите тип отчёта:",
-    typeKeyboard
+  await sendMessage(chatId, "Здравствуйте! Создаём фотоотчёт о выезде.\n\nВыберите тип отчёта:", typeKeyboard);
+}
+
+// ===== Сводка перед отправкой =====
+function buildSummary(session) {
+  const d = session.data;
+  return (
+    `Проверьте отчёт перед отправкой:\n\n` +
+    `Тип: ${reportTypeLabel(d.reportType)}\n` +
+    `Проект: ${d.projectName}\n` +
+    `Дата выезда: ${d.visitDate}\n` +
+    `Ответственное лицо: ${d.responsible}\n` +
+    `Комментарий: ${d.comment ? d.comment : "—"}\n` +
+    `Файлов: ${session.media.length}\n\n` +
+    `Отправить в рабочий чат?`
   );
 }
 
 // ===== Сборка и отправка готового отчёта в целевой чат =====
 async function submitReport(chatId, userId, from) {
   const session = getSession(userId);
-  const d = session.data;
 
+  // Защита от двойного нажатия — не отправляем отчёт повторно.
+  if (session.submitting) return;
   if (!session.media.length) {
-    await sendMessage(chatId, "Вы ещё не прислали ни одного фото или видео. Добавьте файлы и нажмите «Отправить отчёт».");
+    await sendMessage(chatId, "Вы ещё не прислали ни одного фото или видео. Добавьте файлы.", mediaKeyboard);
     return;
   }
+  session.submitting = true;
 
+  const d = session.data;
+  const total = session.media.length;
   const header =
     `${d.reportType === "final" ? "✅" : "🟦"} ${reportTypeLabel(d.reportType)} фотоотчёт\n\n` +
     `Проект: ${d.projectName}\n` +
     `Дата выезда: ${d.visitDate}\n` +
     `Ответственное лицо: ${d.responsible}\n` +
     `Комментарий: ${d.comment ? d.comment : "—"}\n` +
-    `Файлов: ${session.media.length}\n` +
+    `Файлов: ${total}\n` +
     `Отправил: ${senderName(from)}`;
 
-  const total = session.media.length;
-  await sendMessage(chatId, "Отправляю отчёт в рабочий чат…");
+  // Заголовок в рабочий чат. Если упало — бот не в группе / нет прав: сообщаем и даём повторить.
+  try {
+    await sendMessage(TARGET_CHAT_ID, header);
+  } catch (error) {
+    console.error("target header error:", error.message);
+    session.submitting = false;
+    await sendMessage(
+      chatId,
+      "❌ Не удалось отправить в рабочий чат. Проверьте, что бот добавлен в группу и может писать сообщения. " +
+        "Данные сохранены — нажмите «Подтвердить и отправить» ещё раз.",
+      confirmKeyboard
+    );
+    return;
+  }
 
-  // Сначала заголовок, затем каждое медиа копируем по file_id (без перезагрузки — поэтому размер не ограничен).
-  await sendMessage(TARGET_CHAT_ID, header);
+  await sendMessage(chatId, "Отправляю файлы…");
 
+  // Каждое медиа копируем по file_id (без перезагрузки — поэтому размер не ограничен).
   let sent = 0;
   for (const item of session.media) {
     try {
@@ -167,7 +204,7 @@ async function submitReport(chatId, userId, from) {
     const tail = sent < total ? ` (из ${total}; ${total - sent} не удалось)` : "";
     await sendMessage(
       chatId,
-      `✅ Отчёт отправлен в рабочий чат. Файлов переслано: ${sent}${tail}.\n\nЧтобы создать новый отчёт — отправьте /start.`
+      `✅ Отчёт отправлен в рабочий чат. Файлов переслано: ${sent}${tail}.\n\nНовый отчёт — /start.`
     );
   } else {
     await sendMessage(chatId, "❌ Не удалось переслать файлы. Попробуйте ещё раз: /start.");
@@ -204,6 +241,18 @@ async function handleMessage(message) {
 
   const session = getSession(userId);
 
+  // Приём фото/видео работает на шаге сбора файлов и на шаге сводки (можно дослать).
+  const incomingMedia = message.photo || message.video || message.document || message.animation;
+  if (incomingMedia && (session.step === "media" || session.step === "confirm")) {
+    session.media.push({ chatId, messageId: message.message_id });
+    session.step = "media";
+    if (!session.mediaHintShown) {
+      session.mediaHintShown = true;
+      await sendMessage(chatId, "Файлы принимаются. Присылайте ещё, а когда закончите — «Отправить отчёт».", mediaKeyboard);
+    }
+    return;
+  }
+
   switch (session.step) {
     case "project":
       if (!text) return sendMessage(chatId, "Введите наименование проекта текстом.");
@@ -226,33 +275,13 @@ async function handleMessage(message) {
     case "comment":
       session.data.comment = text;
       session.step = "media";
-      return sendMessage(
-        chatId,
-        "Теперь пришлите все фото и видео — по одному или альбомом.\nКогда закончите — нажмите «Отправить отчёт».",
-        mediaKeyboard
-      );
+      return sendMessage(chatId, MEDIA_PROMPT, mediaKeyboard);
 
-    case "media": {
-      const media = message.photo || message.video || message.document || message.animation;
-      if (media) {
-        // Сохраняем ссылку на сообщение, чтобы потом скопировать его по file_id в рабочий чат.
-        session.media.push({ chatId, messageId: message.message_id });
-        if (!session.mediaHintShown) {
-          session.mediaHintShown = true;
-          await sendMessage(
-            chatId,
-            "Файлы принимаются. Присылайте ещё, а когда закончите — нажмите «Отправить отчёт».",
-            mediaKeyboard
-          );
-        }
-        return;
-      }
-      return sendMessage(
-        chatId,
-        "Пришлите фото или видео, либо нажмите «Отправить отчёт».",
-        mediaKeyboard
-      );
-    }
+    case "media":
+      return sendMessage(chatId, "Пришлите фото или видео, либо нажмите «Отправить отчёт».", mediaKeyboard);
+
+    case "confirm":
+      return sendMessage(chatId, "Нажмите «Подтвердить и отправить» или «Добавить ещё файлы».", confirmKeyboard);
 
     default:
       return sendMessage(chatId, "Чтобы создать фотоотчёт о выезде — отправьте /start.");
@@ -297,16 +326,29 @@ async function handleCallback(callback) {
   if (data === "skip_comment") {
     session.data.comment = "";
     session.step = "media";
-    await sendMessage(
-      chatId,
-      "Теперь пришлите все фото и видео — по одному или альбомом.\nКогда закончите — нажмите «Отправить отчёт».",
-      mediaKeyboard
-    );
+    await sendMessage(chatId, MEDIA_PROMPT, mediaKeyboard);
     return;
   }
 
+  // Кнопка «Отправить отчёт» → показываем сводку для подтверждения.
   if (data === "send_report") {
+    if (!session.media.length) {
+      await sendMessage(chatId, "Вы ещё не прислали ни одного файла. Добавьте фото/видео.", mediaKeyboard);
+      return;
+    }
+    session.step = "confirm";
+    await sendMessage(chatId, buildSummary(session), confirmKeyboard);
+    return;
+  }
+
+  if (data === "confirm_send") {
     await submitReport(chatId, userId, callback.from);
+    return;
+  }
+
+  if (data === "add_more") {
+    session.step = "media";
+    await sendMessage(chatId, "Хорошо, пришлите ещё файлы. Когда закончите — «Отправить отчёт».", mediaKeyboard);
     return;
   }
 
@@ -344,7 +386,7 @@ async function poll() {
   }
 }
 
-// ===== HTTP-сервер (нужен Render для проверки порта) =====
+// ===== HTTP-сервер (нужен Render/панели для проверки порта) =====
 const app = express();
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true, mode: "bot", allowedUsers: ALLOWED_USER_IDS.length, hasTarget: Boolean(TARGET_CHAT_ID) });
