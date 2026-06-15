@@ -1,6 +1,7 @@
 import express from "express";
 import dotenv from "dotenv";
 import fetch from "node-fetch";
+import { buildVisitPdf } from "./pdf.js";
 
 dotenv.config();
 
@@ -16,6 +17,16 @@ const ALLOWED_USER_IDS = (process.env.ALLOWED_USER_IDS || "")
 const PORT = Number(process.env.PORT) || 3000;
 
 const API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
+const FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}`;
+
+// Реквизиты для фирменного PDF-отчёта (подвал документа). Закреплены, переопределяются через .env.
+const BRAND = {
+  site: (process.env.PDF_SITE || "бизнес-макет.рф").trim(),
+  managerName: (process.env.PDF_MANAGER_NAME || "Вербицкий Матвей Михайлович").trim(),
+  managerPhone: (process.env.PDF_MANAGER_PHONE || "+7 985 433-75-90").trim(),
+};
+// Максимум фото, попадающих в PDF (защита от тяжёлого файла).
+const PDF_MAX_PHOTOS = Number(process.env.PDF_MAX_PHOTOS) || 20;
 
 // ===== Тексты чек-листов (как в прежнем приложении) =====
 const CHECKLISTS = {
@@ -85,6 +96,35 @@ function sendMessage(chatId, text, replyMarkup) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Скачать файл из Telegram по file_id (download-лимит Bot API — 20 МБ; для фото достаточно).
+async function downloadFile(fileId) {
+  const file = await tg("getFile", { file_id: fileId });
+  const response = await fetch(`${FILE_API}/${file.file_path}`);
+  if (!response.ok) throw new Error(`download ${response.status}`);
+  return Buffer.from(await response.arrayBuffer());
+}
+
+// Отправить документ (PDF) в чат через multipart (нативные fetch/FormData/Blob Node 18+).
+async function sendDocument(chatId, buffer, filename, caption) {
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  if (caption) form.append("caption", caption);
+  form.append("document", new Blob([buffer], { type: "application/pdf" }), filename);
+  const response = await globalThis.fetch(`${API}/sendDocument`, { method: "POST", body: form });
+  const data = await response.json();
+  if (!data.ok) throw new Error(`sendDocument: ${data.description || response.status}`);
+  return data.result;
+}
+
+// Безопасное имя PDF-файла из названия проекта.
+function pdfFilename(d) {
+  const safe = String(d.projectName || "проект")
+    .replace(/[\\/:*?"<>|\n\r\t]+/g, " ")
+    .trim()
+    .slice(0, 50) || "проект";
+  return `Отчёт — ${safe}.pdf`;
 }
 
 // ===== Клавиатуры =====
@@ -232,16 +272,57 @@ async function submitReport(chatId, userId, from) {
     }
   }
 
+  // Фирменный PDF-отчёт для заказчика — только по заключительному выезду.
+  let pdfNote = "";
+  if (d.reportType === "final") {
+    try {
+      await sendMessage(chatId, "Формирую фирменный PDF-отчёт для заказчика…");
+      const photoIds = session.media
+        .filter((m) => m.kind === "photo" && m.fileId)
+        .slice(0, PDF_MAX_PHOTOS)
+        .map((m) => m.fileId);
+      const photos = [];
+      for (const fileId of photoIds) {
+        try {
+          photos.push(await downloadFile(fileId));
+        } catch (error) {
+          console.error("photo download error:", error.message);
+        }
+      }
+      const pdf = await buildVisitPdf(
+        {
+          projectName: d.projectName,
+          visitDate: d.visitDate,
+          responsible: d.responsible,
+          workDone: d.workDone,
+          workNotDone: d.workNotDone,
+          recommendations: d.recommendations,
+        },
+        photos,
+        { brand: BRAND }
+      );
+      const filename = pdfFilename(d);
+      const caption = `📄 Отчёт о выполненных работах — ${d.projectName}`;
+      // В рабочий чат (после отчёта) и сотруднику в личку.
+      await sendDocument(TARGET_CHAT_ID, pdf, filename, caption);
+      await sendDocument(chatId, pdf, filename, "Готовый PDF для заказчика — можно переслать клиенту.");
+      pdfNote = `\n📄 PDF-отчёт сформирован (фото в нём: ${photos.length}) и отправлен в чат и вам в личку.`;
+    } catch (error) {
+      console.error("pdf error:", error.message);
+      pdfNote = "\n⚠️ PDF-отчёт сформировать не удалось — текст и файлы в чат отправлены.";
+    }
+  }
+
   resetSession(userId);
 
   if (sent > 0) {
     const tail = sent < total ? ` (из ${total}; ${total - sent} не удалось)` : "";
     await sendMessage(
       chatId,
-      `✅ Отчёт отправлен в рабочий чат. Файлов переслано: ${sent}${tail}.\n\nНовый отчёт — /start.`
+      `✅ Отчёт отправлен в рабочий чат. Файлов переслано: ${sent}${tail}.${pdfNote}\n\nНовый отчёт — /start.`
     );
   } else {
-    await sendMessage(chatId, "❌ Не удалось переслать файлы. Попробуйте ещё раз: /start.");
+    await sendMessage(chatId, `❌ Не удалось переслать файлы. Попробуйте ещё раз: /start.${pdfNote}`);
   }
 }
 
@@ -278,7 +359,18 @@ async function handleMessage(message) {
   // Приём фото/видео работает на шаге сбора файлов и на шаге сводки (можно дослать).
   const incomingMedia = message.photo || message.video || message.document || message.animation;
   if (incomingMedia && (session.step === "media" || session.step === "confirm")) {
-    session.media.push({ chatId, messageId: message.message_id });
+    // Сохраняем ссылку для пересылки (copyMessage) + file_id фото для вставки в PDF.
+    const item = { chatId, messageId: message.message_id, kind: "other", fileId: null };
+    if (message.photo && message.photo.length) {
+      item.kind = "photo";
+      item.fileId = message.photo[message.photo.length - 1].file_id; // наибольший размер
+    } else if (message.document && /^image\//.test(message.document.mime_type || "")) {
+      item.kind = "photo"; // изображение, присланное «файлом»
+      item.fileId = message.document.file_id;
+    } else if (message.video) {
+      item.kind = "video";
+    }
+    session.media.push(item);
     session.step = "media";
     if (!session.mediaHintShown) {
       session.mediaHintShown = true;
