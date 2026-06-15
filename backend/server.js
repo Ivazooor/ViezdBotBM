@@ -113,6 +113,20 @@ const confirmKeyboard = {
     [{ text: "❌ Отменить", callback_data: "cancel" }],
   ],
 };
+const dateKeyboard = {
+  inline_keyboard: [[{ text: "📅 Сегодня (текущие дата и время)", callback_data: "date_now" }]],
+};
+
+// Текущие дата и время по Москве в формате ДД.ММ.ГГГГ ЧЧ:ММ.
+function nowMoscow() {
+  const parts = new Intl.DateTimeFormat("ru-RU", {
+    timeZone: "Europe/Moscow",
+    day: "2-digit", month: "2-digit", year: "numeric",
+    hour: "2-digit", minute: "2-digit",
+  }).formatToParts(new Date());
+  const p = Object.fromEntries(parts.map((x) => [x.type, x.value]));
+  return `${p.day}.${p.month}.${p.year} ${p.hour}:${p.minute}`;
+}
 
 function reportTypeLabel(type) {
   return type === "final" ? "Заключительный" : "Предварительный";
@@ -120,6 +134,8 @@ function reportTypeLabel(type) {
 
 const MEDIA_PROMPT =
   "Теперь пришлите все фото и видео — по одному или альбомом.\nКогда закончите — нажмите «Отправить отчёт».";
+const DATE_PROMPT =
+  "Укажите дату выезда: нажмите «📅 Сегодня» или введите вручную (например, 15.06.2026).";
 
 // ===== Старт нового отчёта =====
 async function startReport(chatId, userId) {
@@ -258,7 +274,7 @@ async function handleMessage(message) {
       if (!text) return sendMessage(chatId, "Введите наименование проекта текстом.");
       session.data.projectName = text;
       session.step = "date";
-      return sendMessage(chatId, "Укажите дату выезда (например, 15.06.2026):");
+      return sendMessage(chatId, DATE_PROMPT, dateKeyboard);
 
     case "date":
       if (!text) return sendMessage(chatId, "Введите дату выезда текстом.");
@@ -320,6 +336,13 @@ async function handleCallback(callback) {
   if (data === "checklist_ok") {
     session.step = "project";
     await sendMessage(chatId, "Введите наименование проекта:");
+    return;
+  }
+
+  if (data === "date_now") {
+    session.data.visitDate = nowMoscow();
+    session.step = "responsible";
+    await sendMessage(chatId, `Дата выезда: ${session.data.visitDate}\n\nКто ответственное лицо?`);
     return;
   }
 
