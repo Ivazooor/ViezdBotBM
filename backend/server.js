@@ -100,6 +100,12 @@ const checklistKeyboard = {
 const commentKeyboard = {
   inline_keyboard: [[{ text: "Пропустить", callback_data: "skip_comment" }]],
 };
+const workNotDoneKeyboard = {
+  inline_keyboard: [[{ text: "✅ Всё выполнено", callback_data: "work_all_done" }]],
+};
+const recommendationsKeyboard = {
+  inline_keyboard: [[{ text: "Рекомендаций нет", callback_data: "no_recommendations" }]],
+};
 const mediaKeyboard = {
   inline_keyboard: [
     [{ text: "📤 Отправить отчёт", callback_data: "send_report" }],
@@ -144,6 +150,18 @@ async function startReport(chatId, userId) {
   await sendMessage(chatId, "Здравствуйте! Создаём фотоотчёт о выезде.\n\nВыберите тип отчёта:", typeKeyboard);
 }
 
+// Поля отчёта, зависящие от типа (для сводки и заголовка в чате).
+function detailsLines(d) {
+  if (d.reportType === "final") {
+    return (
+      `Выполненные работы: ${d.workDone || "—"}\n` +
+      `Не выполнено: ${d.workNotDone || "—"}\n` +
+      `Рекомендации: ${d.recommendations || "—"}\n`
+    );
+  }
+  return `Перечень задач: ${d.comment ? d.comment : "—"}\n`;
+}
+
 // ===== Сводка перед отправкой =====
 function buildSummary(session) {
   const d = session.data;
@@ -153,7 +171,7 @@ function buildSummary(session) {
     `Проект: ${d.projectName}\n` +
     `Дата выезда: ${d.visitDate}\n` +
     `Ответственное лицо: ${d.responsible}\n` +
-    `Перечень задач: ${d.comment ? d.comment : "—"}\n` +
+    detailsLines(d) +
     `Файлов: ${session.media.length}\n\n` +
     `Отправить в рабочий чат?`
   );
@@ -178,7 +196,7 @@ async function submitReport(chatId, userId, from) {
     `Проект: ${d.projectName}\n` +
     `Дата выезда: ${d.visitDate}\n` +
     `Ответственное лицо: ${d.responsible}\n` +
-    `Перечень задач: ${d.comment ? d.comment : "—"}\n` +
+    detailsLines(d) +
     `Файлов: ${total}\n` +
     `Отправил: ${senderName(from)}`;
 
@@ -285,8 +303,30 @@ async function handleMessage(message) {
     case "responsible":
       if (!text) return sendMessage(chatId, "Введите ответственное лицо текстом.");
       session.data.responsible = text;
+      if (session.data.reportType === "final") {
+        session.step = "workdone";
+        return sendMessage(chatId, "Перечислите, какие работы выполнены:");
+      }
       session.step = "comment";
       return sendMessage(chatId, "Укажите перечень задач на данном выезде или нажмите «Пропустить».", commentKeyboard);
+
+    case "workdone":
+      if (!text) return sendMessage(chatId, "Опишите выполненные работы текстом.");
+      session.data.workDone = text;
+      session.step = "worknotdone";
+      return sendMessage(chatId, "Какие работы не выполнены (если есть) и почему? Опишите или нажмите «Всё выполнено».", workNotDoneKeyboard);
+
+    case "worknotdone":
+      if (!text) return sendMessage(chatId, "Опишите невыполненные работы или нажмите «Всё выполнено».");
+      session.data.workNotDone = text;
+      session.step = "recommendations";
+      return sendMessage(chatId, "Рекомендации по макету (если есть)? Опишите или нажмите «Рекомендаций нет».", recommendationsKeyboard);
+
+    case "recommendations":
+      if (!text) return sendMessage(chatId, "Опишите рекомендации или нажмите «Рекомендаций нет».");
+      session.data.recommendations = text;
+      session.step = "media";
+      return sendMessage(chatId, MEDIA_PROMPT, mediaKeyboard);
 
     case "comment":
       session.data.comment = text;
@@ -348,6 +388,20 @@ async function handleCallback(callback) {
 
   if (data === "skip_comment") {
     session.data.comment = "";
+    session.step = "media";
+    await sendMessage(chatId, MEDIA_PROMPT, mediaKeyboard);
+    return;
+  }
+
+  if (data === "work_all_done") {
+    session.data.workNotDone = "Всё выполнено";
+    session.step = "recommendations";
+    await sendMessage(chatId, "Рекомендации по макету (если есть)? Опишите или нажмите «Рекомендаций нет».", recommendationsKeyboard);
+    return;
+  }
+
+  if (data === "no_recommendations") {
+    session.data.recommendations = "Нет";
     session.step = "media";
     await sendMessage(chatId, MEDIA_PROMPT, mediaKeyboard);
     return;
