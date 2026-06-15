@@ -318,18 +318,19 @@ function handleCallback($cb) {
 }
 
 // ===== Точка входа (webhook) =====
-// Защита: Telegram присылает заданный секрет в заголовке.
-if ($SECRET !== '') {
-  $got = $_SERVER['HTTP_X_TELEGRAM_BOT_API_SECRET_TOKEN'] ?? '';
-  if (!hash_equals($SECRET, $got)) { http_response_code(403); echo 'forbidden'; exit; }
-}
-
 $raw = file_get_contents('php://input');
+
+// GET в браузере (пустое тело) — страница-проверка, без секрета.
 if ($raw === '' || $raw === false) {
-  // Открыли в браузере (GET) — простая страница-проверка.
   header('Content-Type: text/html; charset=utf-8');
   echo '<h1>ViezdBot работает</h1><p>Откройте бота в Telegram и отправьте /start.</p>';
   exit;
+}
+
+// Это webhook (POST с телом) — проверяем секрет от Telegram.
+if ($SECRET !== '') {
+  $got = $_SERVER['HTTP_X_TELEGRAM_BOT_API_SECRET_TOKEN'] ?? '';
+  if (!hash_equals($SECRET, $got)) { http_response_code(403); echo 'forbidden'; exit; }
 }
 
 $update = json_decode($raw, true);
