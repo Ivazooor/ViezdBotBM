@@ -98,7 +98,7 @@ const checklistKeyboard = {
   inline_keyboard: [[{ text: "Всё проверил — продолжить", callback_data: "checklist_ok" }]],
 };
 const commentKeyboard = {
-  inline_keyboard: [[{ text: "Пропустить комментарий", callback_data: "skip_comment" }]],
+  inline_keyboard: [[{ text: "Пропустить", callback_data: "skip_comment" }]],
 };
 const mediaKeyboard = {
   inline_keyboard: [
@@ -153,7 +153,7 @@ function buildSummary(session) {
     `Проект: ${d.projectName}\n` +
     `Дата выезда: ${d.visitDate}\n` +
     `Ответственное лицо: ${d.responsible}\n` +
-    `Комментарий: ${d.comment ? d.comment : "—"}\n` +
+    `Перечень задач: ${d.comment ? d.comment : "—"}\n` +
     `Файлов: ${session.media.length}\n\n` +
     `Отправить в рабочий чат?`
   );
@@ -178,7 +178,7 @@ async function submitReport(chatId, userId, from) {
     `Проект: ${d.projectName}\n` +
     `Дата выезда: ${d.visitDate}\n` +
     `Ответственное лицо: ${d.responsible}\n` +
-    `Комментарий: ${d.comment ? d.comment : "—"}\n` +
+    `Перечень задач: ${d.comment ? d.comment : "—"}\n` +
     `Файлов: ${total}\n` +
     `Отправил: ${senderName(from)}`;
 
@@ -286,7 +286,7 @@ async function handleMessage(message) {
       if (!text) return sendMessage(chatId, "Введите ответственное лицо текстом.");
       session.data.responsible = text;
       session.step = "comment";
-      return sendMessage(chatId, "Добавьте комментарий или нажмите «Пропустить».", commentKeyboard);
+      return sendMessage(chatId, "Укажите перечень задач на данном выезде или нажмите «Пропустить».", commentKeyboard);
 
     case "comment":
       session.data.comment = text;
