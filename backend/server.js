@@ -91,25 +91,44 @@ function senderName(from) {
   return `${parts || "Без имени"}${uname}`;
 }
 
-// ===== Вызов Telegram API =====
+// ===== Вызов Telegram API (с автоповтором при 429 и сетевых сбоях) =====
 async function tg(method, params = {}, timeoutMs = 65000) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetch(`${API}/${method}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(params),
-      signal: controller.signal,
-    });
-    const data = await response.json();
-    if (!data.ok) {
+  let lastErr;
+  for (let attempt = 0; attempt <= 4; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(`${API}/${method}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(params),
+        signal: controller.signal,
+      });
+      const data = await response.json();
+      if (data.ok) return data.result;
+      // 429 Too Many Requests — Telegram просит подождать retry_after секунд и повторить.
+      const retryAfter = data.parameters && data.parameters.retry_after;
+      if (response.status === 429 && retryAfter) {
+        logEvent("warn", `${method}: лимит 429, пауза ${retryAfter}s (попытка ${attempt + 1})`);
+        await sleep((retryAfter + 1) * 1000);
+        continue;
+      }
+      // Прочие ошибки API (400/403 и т.п.) — повторять бессмысленно.
       throw new Error(`${method}: ${data.description || response.status}`);
+    } catch (error) {
+      lastErr = error;
+      // Ошибка API (а не сети) — пробрасываем сразу.
+      if (error.message && error.message.indexOf(`${method}:`) === 0) throw error;
+      // Сетевой сбой/таймаут — короткий backoff и повтор.
+      if (attempt < 4) {
+        logEvent("warn", `${method}: сеть (${error.message}), повтор ${attempt + 1}`);
+        await sleep(800 * (attempt + 1));
+      }
+    } finally {
+      clearTimeout(timer);
     }
-    return data.result;
-  } finally {
-    clearTimeout(timer);
   }
+  throw lastErr || new Error(`${method}: не удалось`);
 }
 
 function sendMessage(chatId, text, replyMarkup) {
@@ -120,6 +139,21 @@ function sendMessage(chatId, text, replyMarkup) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ===== Внутренний журнал (кольцевой буфер) для удалённого чтения логов =====
+const LOG_BUFFER = [];
+const LOG_MAX = 400;
+function logEvent(level, ...parts) {
+  let stamp = "";
+  try {
+    stamp = nowMoscow();
+  } catch (_) {}
+  const msg = parts.map((p) => (typeof p === "string" ? p : String(p))).join(" ");
+  const line = `${stamp} [${level}] ${msg}`;
+  LOG_BUFFER.push(line);
+  if (LOG_BUFFER.length > LOG_MAX) LOG_BUFFER.shift();
+  (level === "error" ? console.error : console.log)(line);
 }
 
 // Скачать файл из Telegram по file_id (download-лимит Bot API — 20 МБ; для фото достаточно).
@@ -286,7 +320,7 @@ async function offerTripChoice(chatId, session) {
   try {
     trips = await bmGetTrips();
   } catch (error) {
-    console.error("bmGetTrips:", error.message);
+    logEvent("error", "bmGetTrips:", error.message);
     await sendMessage(chatId, "⚠️ Не удалось получить список выездов из приложения. Продолжаем без привязки.");
     return goChecklist(chatId, session);
   }
@@ -319,7 +353,7 @@ async function showTripsForView(chatId, session) {
   try {
     trips = await bmGetTrips();
   } catch (error) {
-    console.error("bmGetTrips(view):", error.message);
+    logEvent("error", "bmGetTrips(view):", error.message);
     await sendMessage(chatId, "⚠️ Не удалось получить список выездов из приложения. Попробуйте позже.");
     return;
   }
@@ -345,7 +379,7 @@ async function showTripDetails(chatId, session, tripId) {
       const trips = await bmGetTrips();
       t = trips.find((x) => x && x.id === tripId);
     } catch (error) {
-      console.error("bmGetTrips(details):", error.message);
+      logEvent("error", "bmGetTrips(details):", error.message);
     }
   }
   if (!t) {
@@ -421,7 +455,7 @@ async function submitReport(chatId, userId, from) {
   try {
     await sendMessage(TARGET_CHAT_ID, header);
   } catch (error) {
-    console.error("target header error:", error.message);
+    logEvent("error", "target header error:", error.message);
     session.submitting = false;
     await sendMessage(
       chatId,
@@ -435,8 +469,13 @@ async function submitReport(chatId, userId, from) {
   await sendMessage(chatId, "Отправляю файлы…");
 
   // Каждое медиа копируем по file_id (без перезагрузки — поэтому размер не ограничен).
+  // Пауза между файлами + автоповтор 429 в tg() — чтобы не терять файлы из-за лимита Telegram.
+  const total0 = session.media.length;
+  logEvent("info", `Пересылка ${total0} файлов в рабочий чат (отправитель: ${senderName(from)})`);
   let sent = 0;
-  for (const item of session.media) {
+  let failed = 0;
+  for (let i = 0; i < session.media.length; i++) {
+    const item = session.media[i];
     try {
       await tg("copyMessage", {
         chat_id: TARGET_CHAT_ID,
@@ -445,9 +484,13 @@ async function submitReport(chatId, userId, from) {
       });
       sent += 1;
     } catch (error) {
-      console.error("copyMessage error:", error.message);
+      failed += 1;
+      logEvent("error", `copyMessage #${i + 1}/${total0} не удалось: ${error.message}`);
     }
+    // Throttle: пауза между отправками снижает риск упереться в лимит группы.
+    await sleep(400);
   }
+  logEvent("info", `Переслано ${sent}/${total0}, ошибок ${failed}`);
 
   // Фирменный PDF-отчёт для заказчика — только по заключительному выезду.
   let pdfNote = "";
@@ -463,7 +506,7 @@ async function submitReport(chatId, userId, from) {
         try {
           photos.push(await downloadFile(fileId));
         } catch (error) {
-          console.error("photo download error:", error.message);
+          logEvent("error", "photo download error:", error.message);
         }
       }
       const pdf = await buildVisitPdf(
@@ -485,7 +528,7 @@ async function submitReport(chatId, userId, from) {
       await sendDocument(chatId, pdf, filename, caption);
       pdfNote = `\n📄 PDF-отчёт сформирован (фото в нём: ${photos.length}) и отправлен в чат и вам в личку.`;
     } catch (error) {
-      console.error("pdf error:", error.message);
+      logEvent("error", "pdf error:", error.message);
       pdfNote = "\n⚠️ PDF-отчёт сформировать не удалось — текст и файлы в чат отправлены.";
     }
 
@@ -517,7 +560,7 @@ async function submitReport(chatId, userId, from) {
           });
         }
       } catch (error) {
-        console.error("bm final_report:", error.message);
+        logEvent("error", "bm final_report:", error.message);
       }
     }
 
@@ -541,7 +584,7 @@ async function submitReport(chatId, userId, from) {
         qk
       );
     } catch (error) {
-      console.error("quality buttons error:", error.message);
+      logEvent("error", "quality buttons error:", error.message);
     }
   }
 
@@ -713,7 +756,7 @@ async function handleQualityVote(callback) {
         by: senderName(callback.from),
       });
     } catch (error) {
-      console.error("bm set_quality:", error.message);
+      logEvent("error", "bm set_quality:", error.message);
     }
   }
 
@@ -726,7 +769,7 @@ async function handleQualityVote(callback) {
     // editMessageText без reply_markup убирает кнопки — повторно оценить нельзя.
     await tg("editMessageText", { chat_id: msg.chat.id, message_id: msg.message_id, text: newText });
   } catch (error) {
-    console.error("editMessageText error:", error.message);
+    logEvent("error", "editMessageText error:", error.message);
     await tg("editMessageReplyMarkup", { chat_id: msg.chat.id, message_id: msg.message_id }).catch(() => {});
   }
 
@@ -943,10 +986,10 @@ async function poll() {
       });
       for (const update of updates) {
         offset = update.update_id + 1;
-        await handleUpdate(update).catch((e) => console.error("handleUpdate:", e.message));
+        await handleUpdate(update).catch((e) => logEvent("error", "handleUpdate:", e.message));
       }
     } catch (error) {
-      console.error("poll error:", error.message);
+      logEvent("error", "poll error:", error.message);
       await sleep(3000);
     }
   }
@@ -957,6 +1000,15 @@ const app = express();
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true, mode: "bot", allowedUsers: ALLOWED_USER_IDS.length, hasTarget: Boolean(TARGET_CHAT_ID) });
 });
+// Журнал последних событий — защищён токеном (тем же BM_API_TOKEN). Для диагностики.
+app.get("/api/logs", (req, res) => {
+  const token = String(req.query.token || "");
+  if (!BM_API_TOKEN || token !== BM_API_TOKEN) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  const n = Math.min(Number(req.query.n) || 200, LOG_BUFFER.length);
+  res.json({ ok: true, count: LOG_BUFFER.length, logs: LOG_BUFFER.slice(-n) });
+});
 app.get("*", (_req, res) => {
   res.type("html").send("<h1>Бот выездных фотоотчётов работает</h1><p>Откройте бота в Telegram и отправьте /start.</p>");
 });
@@ -964,11 +1016,11 @@ app.get("*", (_req, res) => {
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`HTTP server on port ${PORT}`);
   if (!TELEGRAM_BOT_TOKEN) {
-    console.error("⚠️  TELEGRAM_BOT_TOKEN не задан — бот не запустится.");
+    logEvent("error", "⚠️  TELEGRAM_BOT_TOKEN не задан — бот не запустится.");
     return;
   }
-  if (!TARGET_CHAT_ID) console.error("⚠️  TELEGRAM_CHAT_ID (целевой чат) не задан.");
-  if (ALLOWED_USER_IDS.length === 0) console.error("⚠️  ALLOWED_USER_IDS пуст — бот никого не пустит.");
+  if (!TARGET_CHAT_ID) logEvent("error", "⚠️  TELEGRAM_CHAT_ID (целевой чат) не задан.");
+  if (ALLOWED_USER_IDS.length === 0) logEvent("error", "⚠️  ALLOWED_USER_IDS пуст — бот никого не пустит.");
   console.log("Запуск Telegram-бота (long polling)…");
   poll();
 });
