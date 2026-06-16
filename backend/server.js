@@ -215,8 +215,8 @@ async function bmGetTrips() {
 // ===== Клавиатуры =====
 const typeKeyboard = {
   inline_keyboard: [
-    [{ text: "🟦 Предварительный", callback_data: "type_pre" }],
-    [{ text: "✅ Заключительный", callback_data: "type_final" }],
+    [{ text: "🟦 Предварительный отчет", callback_data: "type_pre" }],
+    [{ text: "✅ Заключительный отчет", callback_data: "type_final" }],
     [{ text: "👁 Посмотреть выезды", callback_data: "view_trips" }],
   ],
 };
@@ -295,7 +295,7 @@ const DATE_PROMPT =
 async function startReport(chatId, userId) {
   resetSession(userId);
   getSession(userId).step = "type";
-  await sendMessage(chatId, "Здравствуйте! Создаём фотоотчёт о выезде.\n\nВыберите тип отчёта:", typeKeyboard);
+  await sendMessage(chatId, "Привет! Выбери что требуется:", typeKeyboard);
 }
 
 // Показ чек-листа требований (общий шаг после выбора типа и выезда).
