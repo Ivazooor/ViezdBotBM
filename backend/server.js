@@ -191,6 +191,17 @@ const commentKeyboard = {
 const useTasksKeyboard = {
   inline_keyboard: [[{ text: "Использовать задачи", callback_data: "use_tasks" }]],
 };
+// Заключительный, шаг «какие работы выполнены»: вставить задачи из карточки.
+const useTasksDoneKeyboard = {
+  inline_keyboard: [[{ text: "Использовать задачи", callback_data: "use_tasks_done" }]],
+};
+// После вставки задач в «выполнено»: оставить как есть или отредактировать.
+const workDoneConfirmKeyboard = {
+  inline_keyboard: [
+    [{ text: "✅ Оставить как есть", callback_data: "workdone_keep" }],
+    [{ text: "✏️ Отредактировать", callback_data: "workdone_edit" }],
+  ],
+};
 const workNotDoneKeyboard = {
   inline_keyboard: [[{ text: "✅ Всё выполнено", callback_data: "work_all_done" }]],
 };
@@ -613,7 +624,13 @@ async function handleMessage(message) {
       session.data.responsible = text;
       if (session.data.reportType === "final") {
         session.step = "workdone";
-        return sendMessage(chatId, "Перечислите, какие работы выполнены:");
+        return sendMessage(
+          chatId,
+          session.data.tripTasks
+            ? `Перечислите, какие работы выполнены.\n\nЗадачи из карточки выезда:\n${session.data.tripTasks}\n\nОтправьте свой текст, чтобы изменить, или «Использовать задачи» — чтобы вставить задачи из карточки.`
+            : "Перечислите, какие работы выполнены:",
+          session.data.tripTasks ? useTasksDoneKeyboard : undefined
+        );
       }
       session.step = "comment";
       return sendMessage(
@@ -820,11 +837,43 @@ async function handleCallback(callback) {
     return;
   }
 
-  // Вставить задачи из карточки выезда как перечень задач.
+  // Вставить задачи из карточки выезда как перечень задач (предварительный).
   if (data === "use_tasks") {
     session.data.comment = session.data.tripTasks || "";
     session.step = "media";
     await sendMessage(chatId, MEDIA_PROMPT, mediaKeyboard);
+    return;
+  }
+
+  // Заключительный: вставить задачи из карточки в «выполненные работы» → предложить оставить/отредактировать.
+  if (data === "use_tasks_done") {
+    session.data.workDone = session.data.tripTasks || "";
+    await sendMessage(
+      chatId,
+      `Подставлены задачи как выполненные работы:\n${session.data.workDone}\n\nЕсли выполнено всё — «Оставить как есть». Если что-то не выполнили — «Отредактировать» и пришлите исправленный список.`,
+      workDoneConfirmKeyboard
+    );
+    return;
+  }
+
+  // Оставить подставленные задачи как выполненные работы и идти дальше.
+  if (data === "workdone_keep") {
+    session.step = "worknotdone";
+    await sendMessage(
+      chatId,
+      "Какие работы не выполнены (если есть) и почему? Опишите или нажмите «Всё выполнено».",
+      workNotDoneKeyboard
+    );
+    return;
+  }
+
+  // Отредактировать список выполненных работ вручную.
+  if (data === "workdone_edit") {
+    session.step = "workdone";
+    await sendMessage(
+      chatId,
+      `Пришлите отредактированный список выполненных работ (скопируйте и уберите лишнее):\n${session.data.tripTasks || ""}`
+    );
     return;
   }
 
