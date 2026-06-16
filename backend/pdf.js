@@ -296,14 +296,14 @@ function drawBadgeLine(doc, text, left, contentW, ensureSpace) {
   doc.y = y + h;
 }
 
-// Сетка фото 2 колонки, cover-вписывание + рамка + подпись
+// Сетка фото 2 колонки: фото целиком (contain) на белой карточке с мягкой тенью.
 function drawPhotoGrid(doc, photos, left, contentW, maxY, topContent, ensureSpace) {
   const cols = 2;
-  const gap = 12;
+  const gap = 16;
   const cellW = (contentW - gap * (cols - 1)) / cols;
-  const cellH = 168;
-  const capH = 15;
-  const rowH = cellH + capH + 14;
+  const cellH = 172;
+  const capH = 16;
+  const rowH = cellH + capH + 20;
 
   for (let i = 0; i < photos.length; i += cols) {
     // перенос ряда на новую страницу при нехватке места
@@ -322,26 +322,38 @@ function drawPhotoGrid(doc, photos, left, contentW, maxY, topContent, ensureSpac
   }
 }
 
-function drawPhotoCell(doc, buf, x, y, w, h, num) {
-  // фон-плашка
+// Мягкая тень под карточкой (имитация drop-shadow несколькими полупрозрачными слоями).
+function drawSoftShadow(doc, x, y, w, h, r) {
   doc.save();
-  roundedRect(doc, x, y, w, h, 6).fill(COLOR.soft);
+  const layers = 7;
+  for (let i = layers; i >= 1; i--) {
+    doc.fillOpacity(0.04);
+    doc.fillColor("#1A1A1A");
+    doc.roundedRect(x - i, y - i + 2.5, w + i * 2, h + i * 2, r + i).fill();
+  }
+  doc.restore();
+}
+
+function drawPhotoCell(doc, buf, x, y, w, h, num) {
+  const r = 7;
+  const pad = 8; // паспарту: фото не прилипает к краям карточки
+
+  // тень → белая карточка (визуально «возвышается» над листом)
+  drawSoftShadow(doc, x, y, w, h, r);
+  doc.save();
+  roundedRect(doc, x, y, w, h, r).fill(COLOR.white);
   doc.restore();
 
-  // cover-вписывание с клипом
+  // фото целиком (contain) по центру карточки
   try {
     const img = doc.openImage(buf);
-    const scale = Math.max(w / img.width, h / img.height);
+    const scale = Math.min((w - pad * 2) / img.width, (h - pad * 2) / img.height);
     const dw = img.width * scale;
     const dh = img.height * scale;
     const dx = x + (w - dw) / 2;
     const dy = y + (h - dh) / 2;
-    doc.save();
-    roundedRect(doc, x, y, w, h, 6).clip();
     doc.image(buf, dx, dy, { width: dw, height: dh });
-    doc.restore();
   } catch (_) {
-    // битое фото — оставляем плашку с подписью
     doc
       .font("reg")
       .fontSize(9)
@@ -349,9 +361,9 @@ function drawPhotoCell(doc, buf, x, y, w, h, num) {
       .text("Изображение недоступно", x, y + h / 2 - 6, { width: w, align: "center" });
   }
 
-  // тонкая рамка
+  // тонкая рамка карточки
   doc.save().lineWidth(0.8).strokeColor(COLOR.line);
-  roundedRect(doc, x, y, w, h, 6).stroke();
+  roundedRect(doc, x, y, w, h, r).stroke();
   doc.restore();
 
   // подпись
@@ -359,7 +371,7 @@ function drawPhotoCell(doc, buf, x, y, w, h, num) {
     .font("med")
     .fontSize(8.5)
     .fillColor(COLOR.muted)
-    .text(`Фото ${num}`, x, y + h + 4, { width: w, align: "center" });
+    .text(`Фото ${num}`, x, y + h + 7, { width: w, align: "center" });
 }
 
 // Верхний золотой кант

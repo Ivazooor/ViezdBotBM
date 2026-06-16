@@ -9,11 +9,19 @@ dotenv.config();
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || "").trim();
 // Целевой чат/группа, куда бот пересылает готовые отчёты.
 const TARGET_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || "").trim();
+function parseIds(raw) {
+  return (raw || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
 // Список Telegram ID сотрудников, которым разрешено отправлять отчёты (через запятую).
-const ALLOWED_USER_IDS = (process.env.ALLOWED_USER_IDS || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
+const ALLOWED_USER_IDS = parseIds(process.env.ALLOWED_USER_IDS);
+// Кто может оценивать качество выезда кнопками в рабочем чате. Зашиты по умолчанию
+// (этим людям также автоматически открыт доступ к боту), переопределяется через .env.
+const DEFAULT_REVIEWER_IDS =
+  "814705792,508570326,165912761,163743492,1090755229,1504488231,898159043,466665113,758274157,97782197,369094962";
+const QUALITY_REVIEWER_IDS = parseIds(process.env.QUALITY_REVIEWER_IDS || DEFAULT_REVIEWER_IDS);
 const PORT = Number(process.env.PORT) || 3000;
 
 const API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
@@ -58,7 +66,13 @@ function getSession(userId) {
 }
 
 function isAllowed(userId) {
-  return ALLOWED_USER_IDS.length > 0 && ALLOWED_USER_IDS.includes(String(userId));
+  const id = String(userId);
+  // Оценщикам качества доступ к боту открыт автоматически.
+  return ALLOWED_USER_IDS.includes(id) || QUALITY_REVIEWER_IDS.includes(id);
+}
+
+function isReviewer(userId) {
+  return QUALITY_REVIEWER_IDS.includes(String(userId));
 }
 
 function senderName(from) {
@@ -118,13 +132,13 @@ async function sendDocument(chatId, buffer, filename, caption) {
   return data.result;
 }
 
-// Безопасное имя PDF-файла из названия проекта.
+// Имя PDF-файла вида «Отчет о выезде: <Проект> <Дата>.pdf».
 function pdfFilename(d) {
-  const safe = String(d.projectName || "проект")
-    .replace(/[\\/:*?"<>|\n\r\t]+/g, " ")
-    .trim()
-    .slice(0, 50) || "проект";
-  return `Отчёт — ${safe}.pdf`;
+  const clean = (s) => String(s || "").replace(/[\\/\n\r\t]+/g, " ").trim();
+  const project = clean(d.projectName) || "проект";
+  const date = clean(d.visitDate);
+  const name = `Отчет о выезде: ${project} ${date}`.trim().slice(0, 120);
+  return `${name}.pdf`;
 }
 
 // ===== Клавиатуры =====
@@ -150,6 +164,13 @@ const mediaKeyboard = {
   inline_keyboard: [
     [{ text: "📤 Отправить отчёт", callback_data: "send_report" }],
     [{ text: "❌ Отменить", callback_data: "cancel" }],
+  ],
+};
+// Кнопки оценки качества выезда (в рабочем чате; нажимают только оценщики).
+const qualityKeyboard = {
+  inline_keyboard: [
+    [{ text: "✅ Выезд качественный", callback_data: "quality_ok" }],
+    [{ text: "⚠️ Выезд не качественный", callback_data: "quality_bad" }],
   ],
 };
 const confirmKeyboard = {
@@ -302,14 +323,28 @@ async function submitReport(chatId, userId, from) {
         { brand: BRAND }
       );
       const filename = pdfFilename(d);
-      const caption = `📄 Отчёт о выполненных работах — ${d.projectName}`;
+      const caption = "Направляю Вам файл с отчетом по работам";
       // В рабочий чат (после отчёта) и сотруднику в личку.
       await sendDocument(TARGET_CHAT_ID, pdf, filename, caption);
-      await sendDocument(chatId, pdf, filename, "Готовый PDF для заказчика — можно переслать клиенту.");
+      await sendDocument(chatId, pdf, filename, caption);
       pdfNote = `\n📄 PDF-отчёт сформирован (фото в нём: ${photos.length}) и отправлен в чат и вам в личку.`;
     } catch (error) {
       console.error("pdf error:", error.message);
       pdfNote = "\n⚠️ PDF-отчёт сформировать не удалось — текст и файлы в чат отправлены.";
+    }
+
+    // Кнопки оценки качества выезда — в рабочий чат (нажимают только оценщики).
+    try {
+      await sendMessage(
+        TARGET_CHAT_ID,
+        `🔎 Оценка качества выезда\n\n` +
+          `Проект: ${d.projectName}\n` +
+          `Дата выезда: ${d.visitDate}\n` +
+          `Выездник: ${d.responsible}`,
+        qualityKeyboard
+      );
+    } catch (error) {
+      console.error("quality buttons error:", error.message);
     }
   }
 
@@ -437,10 +472,50 @@ async function handleMessage(message) {
 }
 
 // ===== Обработка нажатий на кнопки =====
+// Оценка качества выезда кнопками в рабочем чате. Реагирует только на оценщиков;
+// остальным — всплывающее уведомление, сообщение не меняется.
+async function handleQualityVote(callback) {
+  const userId = callback.from.id;
+  const msg = callback.message;
+
+  if (!isReviewer(userId)) {
+    await tg("answerCallbackQuery", {
+      callback_query_id: callback.id,
+      text: "Оценивать качество выезда может только ответственный.",
+      show_alert: true,
+    });
+    return;
+  }
+
+  const good = callback.data === "quality_ok";
+  const verdict = good ? "✅ Выезд отмечен как КАЧЕСТВЕННЫЙ" : "⚠️ Выезд отмечен как НЕ качественный";
+  // Сохраняем исходный текст (проект/дата/выездник), отбрасывая прежнюю отметку, если была.
+  const baseText = (msg.text || "🔎 Оценка качества выезда").split("\n\n— Оценка —")[0];
+  const newText = `${baseText}\n\n— Оценка —\n${verdict}\nОценил: ${senderName(callback.from)} · ${nowMoscow()}`;
+
+  try {
+    // editMessageText без reply_markup убирает кнопки — повторно оценить нельзя.
+    await tg("editMessageText", { chat_id: msg.chat.id, message_id: msg.message_id, text: newText });
+  } catch (error) {
+    console.error("editMessageText error:", error.message);
+    await tg("editMessageReplyMarkup", { chat_id: msg.chat.id, message_id: msg.message_id }).catch(() => {});
+  }
+
+  await tg("answerCallbackQuery", {
+    callback_query_id: callback.id,
+    text: good ? "Отмечено: качественный" : "Отмечено: не качественный",
+  });
+}
+
 async function handleCallback(callback) {
   const chatId = callback.message.chat.id;
   const userId = callback.from.id;
   const data = callback.data;
+
+  // Кнопки оценки качества (в рабочем чате) — отдельная ветка со своей проверкой прав.
+  if (data === "quality_ok" || data === "quality_bad") {
+    return handleQualityVote(callback);
+  }
 
   if (!isAllowed(userId)) {
     await tg("answerCallbackQuery", { callback_query_id: callback.id, text: "Нет доступа" });
