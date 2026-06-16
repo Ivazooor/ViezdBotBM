@@ -708,7 +708,24 @@ async function handleCallback(callback) {
 
   if (data === "checklist_ok") {
     session.step = "project";
-    await sendMessage(chatId, "Введите наименование проекта:");
+    // Если выезд выбран из приложения — предлагаем его название кнопкой (или ввести вручную).
+    if (session.data.tripName) {
+      await sendMessage(
+        chatId,
+        "Введите наименование проекта или используйте название из карточки выезда:",
+        { inline_keyboard: [[{ text: `📋 ${session.data.tripName}`.slice(0, 60), callback_data: "use_project" }]] }
+      );
+    } else {
+      await sendMessage(chatId, "Введите наименование проекта:");
+    }
+    return;
+  }
+
+  // Использовать название проекта из выбранной карточки выезда.
+  if (data === "use_project") {
+    session.data.projectName = session.data.tripName || "";
+    session.step = "date";
+    await sendMessage(chatId, `Проект: ${session.data.projectName}\n\n${DATE_PROMPT}`, dateKeyboard);
     return;
   }
 
