@@ -178,6 +178,7 @@ const typeKeyboard = {
   inline_keyboard: [
     [{ text: "🟦 Предварительный", callback_data: "type_pre" }],
     [{ text: "✅ Заключительный", callback_data: "type_final" }],
+    [{ text: "👁 Посмотреть выезды", callback_data: "view_trips" }],
   ],
 };
 const checklistKeyboard = {
@@ -286,6 +287,64 @@ async function offerTripChoice(chatId, session) {
     ? "Выберите выезд из отдела «Выезды»:"
     : "Незавершённых выездов в приложении нет. Можно продолжить без привязки.";
   await sendMessage(chatId, head, { inline_keyboard: rows });
+}
+
+// ===== Режим просмотра выездов (кнопка «Посмотреть выезды» в стартовом меню) =====
+async function showTripsForView(chatId, session) {
+  if (!bmEnabled()) {
+    await sendMessage(chatId, "Просмотр выездов недоступен: интеграция с приложением не настроена.");
+    return;
+  }
+  let trips = [];
+  try {
+    trips = await bmGetTrips();
+  } catch (error) {
+    console.error("bmGetTrips(view):", error.message);
+    await sendMessage(chatId, "⚠️ Не удалось получить список выездов из приложения. Попробуйте позже.");
+    return;
+  }
+  session.viewChoices = {};
+  const rows = [];
+  trips.slice(0, 30).forEach((t) => {
+    if (!t || !t.id) return;
+    session.viewChoices[t.id] = t;
+    const label = `🚗 ${t.name || "Без названия"}${t.date ? " · " + t.date : ""}`;
+    rows.push([{ text: label.slice(0, 60), callback_data: "view_" + t.id }]);
+  });
+  rows.push([{ text: "🏠 На старт", callback_data: "back_start" }]);
+  const head = rows.length > 1
+    ? "Выезды из отдела «Выезды» — выберите, чтобы посмотреть задачи:"
+    : "Незавершённых выездов в приложении нет.";
+  await sendMessage(chatId, head, { inline_keyboard: rows });
+}
+
+async function showTripDetails(chatId, session, tripId) {
+  let t = session.viewChoices && session.viewChoices[tripId];
+  if (!t && bmEnabled()) {
+    try {
+      const trips = await bmGetTrips();
+      t = trips.find((x) => x && x.id === tripId);
+    } catch (error) {
+      console.error("bmGetTrips(details):", error.message);
+    }
+  }
+  if (!t) {
+    await sendMessage(chatId, "Выезд не найден — обновите список.", {
+      inline_keyboard: [[{ text: "◀️ К списку", callback_data: "view_trips" }]],
+    });
+    return;
+  }
+  const parts = [`🚗 ${t.name || "Без названия"}`];
+  if (t.date) parts.push(`📅 Дата: ${t.date}`);
+  if (t.address) parts.push(`📍 Адрес: ${t.address}`);
+  if (t.teamly) parts.push(`🔗 Teamly: ${t.teamly}`);
+  parts.push("", "📋 Задачи:", t.comment ? t.comment : "— не указаны");
+  await sendMessage(chatId, parts.join("\n"), {
+    inline_keyboard: [
+      [{ text: "◀️ Назад к списку", callback_data: "view_trips" }],
+      [{ text: "🏠 На старт", callback_data: "back_start" }],
+    ],
+  });
 }
 
 // Поля отчёта, зависящие от типа (для сводки и заголовка в чате).
@@ -671,6 +730,20 @@ async function handleCallback(callback) {
   await tg("answerCallbackQuery", { callback_query_id: callback.id });
 
   const session = getSession(userId);
+
+  // Режим просмотра выездов (без оформления отчёта).
+  if (data === "view_trips") {
+    await showTripsForView(chatId, session);
+    return;
+  }
+  if (data.startsWith("view_")) {
+    await showTripDetails(chatId, session, data.slice(5));
+    return;
+  }
+  if (data === "back_start") {
+    await startReport(chatId, userId);
+    return;
+  }
 
   if (data === "type_pre" || data === "type_final") {
     session.data.reportType = data === "type_final" ? "final" : "pre";
