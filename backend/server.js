@@ -15,8 +15,13 @@ function parseIds(raw) {
     .map((s) => s.trim())
     .filter(Boolean);
 }
-// Список Telegram ID сотрудников, которым разрешено отправлять отчёты (через запятую).
-const ALLOWED_USER_IDS = parseIds(process.env.ALLOWED_USER_IDS);
+// Дополнительные сотрудники с доступом к боту (зашиты в коде, помимо .env ALLOWED_USER_IDS).
+const EXTRA_ALLOWED_IDS = "983796960,369094962,1416285563,475858355";
+// Список Telegram ID сотрудников, которым разрешено отправлять отчёты.
+// Объединяем .env и зашитые ID; Set убирает дубликаты.
+const ALLOWED_USER_IDS = [
+  ...new Set([...parseIds(process.env.ALLOWED_USER_IDS), ...parseIds(EXTRA_ALLOWED_IDS)]),
+];
 // Кто может оценивать качество выезда кнопками в рабочем чате. Зашиты по умолчанию
 // (этим людям также автоматически открыт доступ к боту), переопределяется через .env.
 const DEFAULT_REVIEWER_IDS =
