@@ -187,6 +187,10 @@ const checklistKeyboard = {
 const commentKeyboard = {
   inline_keyboard: [[{ text: "Пропустить", callback_data: "skip_comment" }]],
 };
+// Когда задачи подтянуты из карточки выезда — кнопка вставить их как есть.
+const useTasksKeyboard = {
+  inline_keyboard: [[{ text: "Использовать задачи", callback_data: "use_tasks" }]],
+};
 const workNotDoneKeyboard = {
   inline_keyboard: [[{ text: "✅ Всё выполнено", callback_data: "work_all_done" }]],
 };
@@ -615,9 +619,9 @@ async function handleMessage(message) {
       return sendMessage(
         chatId,
         session.data.tripTasks
-          ? `Задачи из карточки выезда подставлены:\n${session.data.tripTasks}\n\nОтправьте свой текст, чтобы изменить, или «Пропустить» — оставить как есть.`
+          ? `Задачи из карточки выезда подставлены:\n${session.data.tripTasks}\n\nОтправьте свой текст, чтобы изменить, или «Использовать задачи» — чтобы вставить задачи из карточки.`
           : "Укажите перечень задач на данном выезде или нажмите «Пропустить».",
-        commentKeyboard
+        session.data.tripTasks ? useTasksKeyboard : commentKeyboard
       );
 
     case "workdone":
@@ -810,7 +814,14 @@ async function handleCallback(callback) {
   }
 
   if (data === "skip_comment") {
-    // Если задачи подтянуты из карточки — оставляем их.
+    session.data.comment = "";
+    session.step = "media";
+    await sendMessage(chatId, MEDIA_PROMPT, mediaKeyboard);
+    return;
+  }
+
+  // Вставить задачи из карточки выезда как перечень задач.
+  if (data === "use_tasks") {
     session.data.comment = session.data.tripTasks || "";
     session.step = "media";
     await sendMessage(chatId, MEDIA_PROMPT, mediaKeyboard);
