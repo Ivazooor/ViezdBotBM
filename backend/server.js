@@ -36,6 +36,11 @@ const BRAND = {
 // Максимум фото, попадающих в PDF (защита от тяжёлого файла).
 const PDF_MAX_PHOTOS = Number(process.env.PDF_MAX_PHOTOS) || 20;
 
+// Интеграция с KPI-приложением (отдел «Выезды»): выбор карточки выезда + запись результата.
+// Токен ТОЛЬКО из .env (репозиторий публичный — не хардкодить!). Пусто → интеграция отключена.
+const BM_API_URL = (process.env.BM_API_URL || "https://xn----8sbbqciguqh9br.xn--p1ai/api/bot.php").trim();
+const BM_API_TOKEN = (process.env.BM_API_TOKEN || "").trim();
+
 // ===== Тексты чек-листов (как в прежнем приложении) =====
 const CHECKLISTS = {
   pre: [
@@ -141,6 +146,33 @@ function pdfFilename(d) {
   return `${name}.pdf`;
 }
 
+// ===== Интеграция с KPI-приложением (api/bot.php) =====
+function bmEnabled() {
+  return Boolean(BM_API_TOKEN);
+}
+
+async function bmApi(method, payload = {}) {
+  if (!BM_API_TOKEN) throw new Error("BM_API_TOKEN не задан");
+  const opts = { method, headers: { "X-Bot-Token": BM_API_TOKEN } };
+  let url = BM_API_URL;
+  if (method === "GET") {
+    url += (url.includes("?") ? "&" : "?") + "op=" + encodeURIComponent(payload.op || "trips");
+  } else {
+    opts.headers["Content-Type"] = "application/json";
+    opts.body = JSON.stringify(payload);
+  }
+  const response = await fetch(url, opts);
+  const data = await response.json().catch(() => ({}));
+  if (!data.ok) throw new Error(data.error || `api ${response.status}`);
+  return data;
+}
+
+// Список незавершённых выездов для выбора в боте.
+async function bmGetTrips() {
+  const data = await bmApi("GET", { op: "trips" });
+  return Array.isArray(data.trips) ? data.trips : [];
+}
+
 // ===== Клавиатуры =====
 const typeKeyboard = {
   inline_keyboard: [
@@ -209,6 +241,51 @@ async function startReport(chatId, userId) {
   resetSession(userId);
   getSession(userId).step = "type";
   await sendMessage(chatId, "Здравствуйте! Создаём фотоотчёт о выезде.\n\nВыберите тип отчёта:", typeKeyboard);
+}
+
+// Показ чек-листа требований (общий шаг после выбора типа и выезда).
+async function goChecklist(chatId, session) {
+  session.step = "checklist";
+  const items = CHECKLISTS[session.data.reportType === "final" ? "final" : "pre"];
+  const list = items.map((t, i) => `${i + 1}. ${t}`).join("\n");
+  await sendMessage(
+    chatId,
+    `Тип: ${reportTypeLabel(session.data.reportType)}.\n\nПроверьте перед отправкой:\n\n${list}`,
+    checklistKeyboard
+  );
+}
+
+// Вторым действием после выбора типа — выбор выезда из отдела «Выезды».
+async function offerTripChoice(chatId, session) {
+  const isFinal = session.data.reportType === "final";
+  // Интеграция не настроена (нет токена) — идём по старому сценарию без привязки.
+  if (!bmEnabled()) return goChecklist(chatId, session);
+
+  let trips = [];
+  try {
+    trips = await bmGetTrips();
+  } catch (error) {
+    console.error("bmGetTrips:", error.message);
+    await sendMessage(chatId, "⚠️ Не удалось получить список выездов из приложения. Продолжаем без привязки.");
+    return goChecklist(chatId, session);
+  }
+
+  session.tripChoices = {};
+  const rows = [];
+  trips.slice(0, 30).forEach((t) => {
+    if (!t || !t.id) return;
+    session.tripChoices[t.id] = t;
+    const label = `🚗 ${t.name || "Без названия"}${t.date ? " · " + t.date : ""}`;
+    rows.push([{ text: label.slice(0, 60), callback_data: "pick_" + t.id }]);
+  });
+  if (isFinal) rows.push([{ text: "➕ Создать карточку", callback_data: "pick_create" }]);
+  rows.push([{ text: "⏭ Пропустить", callback_data: "pick_skip" }]);
+
+  session.step = "picktrip";
+  const head = rows.length > 1
+    ? "Выберите выезд из отдела «Выезды»:"
+    : "Незавершённых выездов в приложении нет. Можно продолжить без привязки.";
+  await sendMessage(chatId, head, { inline_keyboard: rows });
 }
 
 // Поля отчёта, зависящие от типа (для сводки и заголовка в чате).
@@ -333,7 +410,48 @@ async function submitReport(chatId, userId, from) {
       pdfNote = "\n⚠️ PDF-отчёт сформировать не удалось — текст и файлы в чат отправлены.";
     }
 
+    // Запись результата в карточку выезда KPI-приложения (если интеграция включена).
+    let kpiTripId = d.tripId || null;
+    if (bmEnabled()) {
+      try {
+        if (d.tripCreate) {
+          // Запасная кнопка «Создать карточку» — заводим выезд из данных бота.
+          const created = await bmApi("POST", {
+            op: "create",
+            name: d.projectName,
+            date: d.visitDate,
+            comment: d.tripTasks || "",
+            workDone: d.workDone,
+            workNotDone: d.workNotDone,
+            recommendations: d.recommendations,
+            by: senderName(from),
+          });
+          kpiTripId = created.id || null;
+        } else if (kpiTripId) {
+          await bmApi("POST", {
+            op: "final_report",
+            tripId: kpiTripId,
+            workDone: d.workDone,
+            workNotDone: d.workNotDone,
+            recommendations: d.recommendations,
+            by: senderName(from),
+          });
+        }
+      } catch (error) {
+        console.error("bm final_report:", error.message);
+      }
+    }
+
     // Кнопки оценки качества выезда — в рабочий чат (нажимают только оценщики).
+    // Если выезд привязан к карточке — оценка запишется в KPI (callback несёт tripId).
+    const qk = kpiTripId
+      ? {
+          inline_keyboard: [
+            [{ text: "✅ Выезд качественный", callback_data: "quality_ok|" + kpiTripId }],
+            [{ text: "⚠️ Выезд не качественный", callback_data: "quality_bad|" + kpiTripId }],
+          ],
+        }
+      : qualityKeyboard;
     try {
       await sendMessage(
         TARGET_CHAT_ID,
@@ -341,7 +459,7 @@ async function submitReport(chatId, userId, from) {
           `Проект: ${d.projectName}\n` +
           `Дата выезда: ${d.visitDate}\n` +
           `Выездник: ${d.responsible}`,
-        qualityKeyboard
+        qk
       );
     } catch (error) {
       console.error("quality buttons error:", error.message);
@@ -435,7 +553,13 @@ async function handleMessage(message) {
         return sendMessage(chatId, "Перечислите, какие работы выполнены:");
       }
       session.step = "comment";
-      return sendMessage(chatId, "Укажите перечень задач на данном выезде или нажмите «Пропустить».", commentKeyboard);
+      return sendMessage(
+        chatId,
+        session.data.tripTasks
+          ? `Задачи из карточки выезда подставлены:\n${session.data.tripTasks}\n\nОтправьте свой текст, чтобы изменить, или «Пропустить» — оставить как есть.`
+          : "Укажите перечень задач на данном выезде или нажмите «Пропустить».",
+        commentKeyboard
+      );
 
     case "workdone":
       if (!text) return sendMessage(chatId, "Опишите выполненные работы текстом.");
@@ -466,6 +590,9 @@ async function handleMessage(message) {
     case "confirm":
       return sendMessage(chatId, "Нажмите «Подтвердить и отправить» или «Добавить ещё файлы».", confirmKeyboard);
 
+    case "picktrip":
+      return sendMessage(chatId, "Выберите выезд из списка кнопкой выше (или «Пропустить»).");
+
     default:
       return sendMessage(chatId, "Чтобы создать фотоотчёт о выезде — отправьте /start.");
   }
@@ -487,7 +614,24 @@ async function handleQualityVote(callback) {
     return;
   }
 
-  const good = callback.data === "quality_ok";
+  const good = callback.data.startsWith("quality_ok");
+  // tripId передаётся в callback после «|», если выезд был привязан к карточке.
+  const tripId = callback.data.includes("|") ? callback.data.split("|")[1] : null;
+
+  // Запись оценки в карточку выезда KPI-приложения.
+  if (bmEnabled() && tripId) {
+    try {
+      await bmApi("POST", {
+        op: "set_quality",
+        tripId,
+        quality: good ? "yes" : "no",
+        by: senderName(callback.from),
+      });
+    } catch (error) {
+      console.error("bm set_quality:", error.message);
+    }
+  }
+
   const verdict = good ? "✅ Выезд отмечен как КАЧЕСТВЕННЫЙ" : "⚠️ Выезд отмечен как НЕ качественный";
   // Сохраняем исходный текст (проект/дата/выездник), отбрасывая прежнюю отметку, если была.
   const baseText = (msg.text || "🔎 Оценка качества выезда").split("\n\n— Оценка —")[0];
@@ -513,7 +657,8 @@ async function handleCallback(callback) {
   const data = callback.data;
 
   // Кнопки оценки качества (в рабочем чате) — отдельная ветка со своей проверкой прав.
-  if (data === "quality_ok" || data === "quality_bad") {
+  // callback может нести tripId после «|» (quality_ok|<id>).
+  if (data.startsWith("quality_ok") || data.startsWith("quality_bad")) {
     return handleQualityVote(callback);
   }
 
@@ -529,14 +674,35 @@ async function handleCallback(callback) {
 
   if (data === "type_pre" || data === "type_final") {
     session.data.reportType = data === "type_final" ? "final" : "pre";
-    session.step = "checklist";
-    const items = CHECKLISTS[session.data.reportType === "final" ? "final" : "pre"];
-    const list = items.map((t, i) => `${i + 1}. ${t}`).join("\n");
-    await sendMessage(
-      chatId,
-      `Тип: ${reportTypeLabel(session.data.reportType)}.\n\nПроверьте перед отправкой:\n\n${list}`,
-      checklistKeyboard
-    );
+    // Вторым действием — выбор выезда из отдела «Выезды».
+    await offerTripChoice(chatId, session);
+    return;
+  }
+
+  // Выбор выезда из списка / «Пропустить» / «Создать карточку».
+  if (data.startsWith("pick_")) {
+    const key = data.slice(5);
+    if (key === "skip") {
+      session.data.tripId = null;
+    } else if (key === "create") {
+      session.data.tripId = null;
+      session.data.tripCreate = true; // карточка будет создана при отправке (только заключительный)
+    } else {
+      const t = session.tripChoices && session.tripChoices[key];
+      if (t) {
+        session.data.tripId = t.id;
+        session.data.tripName = t.name || "";
+        session.data.tripTasks = t.comment || ""; // «Задачи на выезд» = поле comment
+      }
+    }
+    // Для предварительного — подтянуть и показать задачи из карточки.
+    if (session.data.reportType !== "final" && session.data.tripId) {
+      const tasks = session.data.tripTasks
+        ? `📋 Задачи по выезду «${session.data.tripName}»:\n${session.data.tripTasks}`
+        : `📋 В карточке выезда «${session.data.tripName}» задачи не указаны — впишете вручную.`;
+      await sendMessage(chatId, tasks);
+    }
+    await goChecklist(chatId, session);
     return;
   }
 
@@ -554,7 +720,8 @@ async function handleCallback(callback) {
   }
 
   if (data === "skip_comment") {
-    session.data.comment = "";
+    // Если задачи подтянуты из карточки — оставляем их.
+    session.data.comment = session.data.tripTasks || "";
     session.step = "media";
     await sendMessage(chatId, MEDIA_PROMPT, mediaKeyboard);
     return;
