@@ -197,7 +197,10 @@ async function bmApi(method, payload = {}) {
   const opts = { method, headers: { "X-Bot-Token": BM_API_TOKEN } };
   let url = BM_API_URL;
   if (method === "GET") {
-    url += (url.includes("?") ? "&" : "?") + "op=" + encodeURIComponent(payload.op || "trips");
+    const qs = Object.keys(payload)
+      .map((k) => encodeURIComponent(k) + "=" + encodeURIComponent(payload[k]))
+      .join("&");
+    url += (url.includes("?") ? "&" : "?") + (qs || "op=trips");
   } else {
     opts.headers["Content-Type"] = "application/json";
     opts.body = JSON.stringify(payload);
@@ -212,6 +215,15 @@ async function bmApi(method, payload = {}) {
 async function bmGetTrips() {
   const data = await bmApi("GET", { op: "trips" });
   return Array.isArray(data.trips) ? data.trips : [];
+}
+
+// Профиль сотрудника (ФИО) по Telegram ID.
+async function bmGetProfile(userId) {
+  const data = await bmApi("GET", { op: "profile", uid: String(userId) });
+  return data.profile || null;
+}
+async function bmSaveProfile(userId, fio) {
+  return bmApi("POST", { op: "save_profile", uid: String(userId), fio });
 }
 
 // Дата выезда «YYYY-MM-DD» → «ДД / месяц словом» (без года); иначе как есть.
@@ -312,8 +324,34 @@ const DATE_PROMPT =
 // ===== Старт нового отчёта =====
 async function startReport(chatId, userId) {
   resetSession(userId);
-  getSession(userId).step = "type";
+  const session = getSession(userId);
+
+  // Загружаем профиль (ФИО). При первом входе — просим заполнить.
+  if (bmEnabled()) {
+    try {
+      const profile = await bmGetProfile(userId);
+      if (profile && profile.fio) session.profileFio = profile.fio;
+    } catch (error) {
+      logEvent("error", "bmGetProfile:", error.message);
+    }
+    if (!session.profileFio) {
+      session.step = "register_fio";
+      await sendMessage(
+        chatId,
+        "Здравствуйте! Это первый вход. Напишите, пожалуйста, ваше ФИО — оно будет автоматически подставляться в отчёты (вводить каждый раз не нужно):"
+      );
+      return;
+    }
+  }
+
+  session.step = "type";
   await sendMessage(chatId, "Привет! Выбери что требуется:", typeKeyboard);
+}
+
+// Меню выбора типа отчёта (после старта/регистрации).
+function showTypeMenu(chatId, session) {
+  session.step = "type";
+  return sendMessage(chatId, "Привет! Выбери что требуется:", typeKeyboard);
 }
 
 // Показ чек-листа требований (общий шаг после выбора типа и выезда).
@@ -325,6 +363,39 @@ async function goChecklist(chatId, session) {
     chatId,
     `Тип: ${reportTypeLabel(session.data.reportType)}.\n\nПроверьте перед отправкой:\n\n${list}`,
     checklistKeyboard
+  );
+}
+
+// Шаг «ответственное лицо»: если в профиле есть ФИО — подставляем автоматически.
+async function askResponsibleOrSkip(chatId, session) {
+  if (session.profileFio) {
+    session.data.responsible = session.profileFio;
+    await sendMessage(chatId, `Ответственное лицо: ${session.profileFio} (из профиля).`);
+    return goAfterResponsible(chatId, session);
+  }
+  session.step = "responsible";
+  return sendMessage(chatId, "Кто ответственное лицо?");
+}
+
+// Шаги после ответственного лица (зависят от типа отчёта).
+function goAfterResponsible(chatId, session) {
+  if (session.data.reportType === "final") {
+    session.step = "workdone";
+    return sendMessage(
+      chatId,
+      session.data.tripTasks
+        ? `Перечислите, какие работы выполнены.\n\nЗадачи из карточки выезда:\n${session.data.tripTasks}\n\nОтправьте свой текст, чтобы изменить, или «Использовать задачи» — чтобы вставить задачи из карточки.`
+        : "Перечислите, какие работы выполнены:",
+      session.data.tripTasks ? useTasksDoneKeyboard : undefined
+    );
+  }
+  session.step = "comment";
+  return sendMessage(
+    chatId,
+    session.data.tripTasks
+      ? `Задачи из карточки выезда подставлены:\n${session.data.tripTasks}\n\nОтправьте свой текст, чтобы изменить, или «Использовать задачи» — чтобы вставить задачи из карточки.`
+      : "Укажите перечень задач на данном выезде или нажмите «Пропустить».",
+    session.data.tripTasks ? useTasksKeyboard : commentKeyboard
   );
 }
 
@@ -644,6 +715,22 @@ async function handleMessage(message) {
     await sendMessage(chatId, "Отменено. Чтобы начать заново — /start.");
     return;
   }
+  // Изменить ФИО профиля.
+  if (text === "/profile" || text === "/fio") {
+    const session = getSession(userId);
+    session.step = "register_fio";
+    let cur = session.profileFio;
+    if (!cur && bmEnabled()) {
+      try {
+        const p = await bmGetProfile(userId);
+        cur = p && p.fio;
+      } catch (error) {
+        logEvent("error", "bmGetProfile(/profile):", error.message);
+      }
+    }
+    await sendMessage(chatId, `Ваше ФИО: ${cur || "не задано"}\n\nВведите новое ФИО:`);
+    return;
+  }
 
   const session = getSession(userId);
 
@@ -677,33 +764,28 @@ async function handleMessage(message) {
       session.step = "date";
       return sendMessage(chatId, DATE_PROMPT, dateKeyboard);
 
+    case "register_fio":
+      if (!text) return sendMessage(chatId, "Введите ФИО текстом.");
+      session.profileFio = text;
+      if (bmEnabled()) {
+        try {
+          await bmSaveProfile(userId, text);
+        } catch (error) {
+          logEvent("error", "bmSaveProfile:", error.message);
+        }
+      }
+      await sendMessage(chatId, `Спасибо, ${text}! Профиль сохранён.`);
+      return showTypeMenu(chatId, session);
+
     case "date":
       if (!text) return sendMessage(chatId, "Введите дату выезда текстом.");
       session.data.visitDate = text;
-      session.step = "responsible";
-      return sendMessage(chatId, "Кто ответственное лицо?");
+      return askResponsibleOrSkip(chatId, session);
 
     case "responsible":
       if (!text) return sendMessage(chatId, "Введите ответственное лицо текстом.");
       session.data.responsible = text;
-      if (session.data.reportType === "final") {
-        session.step = "workdone";
-        return sendMessage(
-          chatId,
-          session.data.tripTasks
-            ? `Перечислите, какие работы выполнены.\n\nЗадачи из карточки выезда:\n${session.data.tripTasks}\n\nОтправьте свой текст, чтобы изменить, или «Использовать задачи» — чтобы вставить задачи из карточки.`
-            : "Перечислите, какие работы выполнены:",
-          session.data.tripTasks ? useTasksDoneKeyboard : undefined
-        );
-      }
-      session.step = "comment";
-      return sendMessage(
-        chatId,
-        session.data.tripTasks
-          ? `Задачи из карточки выезда подставлены:\n${session.data.tripTasks}\n\nОтправьте свой текст, чтобы изменить, или «Использовать задачи» — чтобы вставить задачи из карточки.`
-          : "Укажите перечень задач на данном выезде или нажмите «Пропустить».",
-        session.data.tripTasks ? useTasksKeyboard : commentKeyboard
-      );
+      return goAfterResponsible(chatId, session);
 
     case "workdone":
       if (!text) return sendMessage(chatId, "Опишите выполненные работы текстом.");
@@ -959,8 +1041,8 @@ async function handleCallback(callback) {
 
   if (data === "date_now") {
     session.data.visitDate = nowMoscow();
-    session.step = "responsible";
-    await sendMessage(chatId, `Дата выезда: ${session.data.visitDate}\n\nКто ответственное лицо?`);
+    await sendMessage(chatId, `Дата выезда: ${session.data.visitDate}`);
+    await askResponsibleOrSkip(chatId, session);
     return;
   }
 
