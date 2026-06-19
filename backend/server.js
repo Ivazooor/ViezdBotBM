@@ -45,6 +45,8 @@ const PDF_MAX_PHOTOS = Number(process.env.PDF_MAX_PHOTOS) || 20;
 // Токен ТОЛЬКО из .env (репозиторий публичный — не хардкодить!). Пусто → интеграция отключена.
 const BM_API_URL = (process.env.BM_API_URL || "https://xn----8sbbqciguqh9br.xn--p1ai/api/bot.php").trim();
 const BM_API_TOKEN = (process.env.BM_API_TOKEN || "").trim();
+// Кого упоминать в вопросе «выезд выполнен?» (ответственный за финальный статус).
+const STATUS_MENTION = (process.env.STATUS_MENTION || "@matiyver").trim();
 
 // ===== Тексты чек-листов (как в прежнем приложении) =====
 const CHECKLISTS = {
@@ -786,6 +788,72 @@ async function handleQualityVote(callback) {
     callback_query_id: callback.id,
     text: good ? "Отмечено: качественный" : "Отмечено: не качественный",
   });
+
+  // После оценки — спросить у ответственного финальный статус выезда (Выполнен/Брак).
+  if (bmEnabled() && tripId) {
+    try {
+      await sendMessage(
+        TARGET_CHAT_ID,
+        `${STATUS_MENTION} Отмечаем что выезд выполнен?`,
+        {
+          inline_keyboard: [
+            [{ text: "✅ Выполнен", callback_data: "done_ok|" + tripId }],
+            [{ text: "⚠️ Не выполнен", callback_data: "done_bad|" + tripId }],
+          ],
+        }
+      );
+    } catch (error) {
+      logEvent("error", "status buttons:", error.message);
+    }
+  }
+}
+
+// Финальный статус выезда (кнопки «Выполнен/Не выполнен» в чате). Только оценщики.
+async function handleStatusVote(callback) {
+  const userId = callback.from.id;
+  const msg = callback.message;
+
+  if (!isReviewer(userId)) {
+    await tg("answerCallbackQuery", {
+      callback_query_id: callback.id,
+      text: "Отмечать статус выезда может только ответственный.",
+      show_alert: true,
+    });
+    return;
+  }
+
+  const done = callback.data.startsWith("done_ok");
+  const tripId = callback.data.includes("|") ? callback.data.split("|")[1] : null;
+
+  // Меняем статус выезда в карточке: done → «Выполнено», bad → «Брак».
+  if (bmEnabled() && tripId) {
+    try {
+      await bmApi("POST", {
+        op: "set_board",
+        tripId,
+        status: done ? "done" : "bad",
+        by: senderName(callback.from),
+      });
+    } catch (error) {
+      logEvent("error", "bm set_board:", error.message);
+    }
+  }
+
+  const verdict = done ? "✅ Выезд отмечен ВЫПОЛНЕННЫМ" : "⚠️ Выезд отмечен как БРАК";
+  const baseText = (msg.text || "Отмечаем что выезд выполнен?").split("\n\n— Статус —")[0];
+  const newText = `${baseText}\n\n— Статус —\n${verdict}\nОтметил: ${senderName(callback.from)} · ${nowMoscow()}`;
+
+  try {
+    await tg("editMessageText", { chat_id: msg.chat.id, message_id: msg.message_id, text: newText });
+  } catch (error) {
+    logEvent("error", "editMessageText(status):", error.message);
+    await tg("editMessageReplyMarkup", { chat_id: msg.chat.id, message_id: msg.message_id }).catch(() => {});
+  }
+
+  await tg("answerCallbackQuery", {
+    callback_query_id: callback.id,
+    text: done ? "Отмечено: выполнен" : "Отмечено: брак",
+  });
 }
 
 async function handleCallback(callback) {
@@ -797,6 +865,10 @@ async function handleCallback(callback) {
   // callback может нести tripId после «|» (quality_ok|<id>).
   if (data.startsWith("quality_ok") || data.startsWith("quality_bad")) {
     return handleQualityVote(callback);
+  }
+  // Кнопки финального статуса выезда (Выполнен/Брак) — тоже своя проверка прав.
+  if (data.startsWith("done_ok") || data.startsWith("done_bad")) {
+    return handleStatusVote(callback);
   }
 
   if (!isAllowed(userId)) {
