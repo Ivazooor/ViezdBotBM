@@ -47,6 +47,12 @@ const BM_API_URL = (process.env.BM_API_URL || "https://xn----8sbbqciguqh9br.xn--
 const BM_API_TOKEN = (process.env.BM_API_TOKEN || "").trim();
 // Кого упоминать в вопросе «выезд выполнен?» (ответственный за финальный статус).
 const STATUS_MENTION = (process.env.STATUS_MENTION || "@matiyver").trim();
+// Кого тегать отдельным сообщением при заключительном отчёте (для уведомления).
+// Упоминание по ID (tg://user?id=) уведомляет участников чата даже без username.
+const NOTIFY_FINAL = [
+  { id: "1504488231", name: "Руководитель" },
+  { id: "508570326", name: "@danil_mck" },
+];
 
 // ===== Тексты чек-листов (как в прежнем приложении) =====
 const CHECKLISTS = {
@@ -314,6 +320,11 @@ function nowMoscow() {
 
 function reportTypeLabel(type) {
   return type === "final" ? "Заключительный" : "Предварительный";
+}
+
+// Экранирование для parse_mode HTML.
+function htmlEscape(s) {
+  return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 const MEDIA_PROMPT =
@@ -672,6 +683,20 @@ async function submitReport(chatId, userId, from) {
       );
     } catch (error) {
       logEvent("error", "quality buttons error:", error.message);
+    }
+
+    // Третье сообщение — тег ответственных (для уведомления), упоминание по ID.
+    try {
+      const mentions = NOTIFY_FINAL
+        .map((u) => `<a href="tg://user?id=${u.id}">${htmlEscape(u.name)}</a>`)
+        .join(" ");
+      await tg("sendMessage", {
+        chat_id: TARGET_CHAT_ID,
+        text: `🔔 ${mentions} — поступил заключительный отчёт по выезду «${htmlEscape(d.projectName)}». Просьба проверить.`,
+        parse_mode: "HTML",
+      });
+    } catch (error) {
+      logEvent("error", "notify mentions error:", error.message);
     }
   }
 
