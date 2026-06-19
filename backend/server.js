@@ -212,6 +212,17 @@ async function bmGetTrips() {
   return Array.isArray(data.trips) ? data.trips : [];
 }
 
+// Дата выезда «YYYY-MM-DD» → «ДД-ММ» (без года); иначе как есть.
+function tripDateShort(date) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(date || ""));
+  return m ? `${m[3]}-${m[2]}` : String(date || "");
+}
+// Подпись выезда на кнопке: «Название · ДД-ММ» (без машинки).
+function tripLabel(t) {
+  const d = tripDateShort(t.date);
+  return `${t.name || "Без названия"}${d ? " · " + d : ""}`.slice(0, 64);
+}
+
 // ===== Клавиатуры =====
 const typeKeyboard = {
   inline_keyboard: [
@@ -330,8 +341,7 @@ async function offerTripChoice(chatId, session) {
   trips.slice(0, 30).forEach((t) => {
     if (!t || !t.id) return;
     session.tripChoices[t.id] = t;
-    const label = `🚗 ${t.name || "Без названия"}${t.date ? " · " + t.date : ""}`;
-    rows.push([{ text: label.slice(0, 60), callback_data: "pick_" + t.id }]);
+    rows.push([{ text: tripLabel(t), callback_data: "pick_" + t.id }]);
   });
   if (isFinal) rows.push([{ text: "➕ Создать карточку", callback_data: "pick_create" }]);
   rows.push([{ text: "⏭ Пропустить", callback_data: "pick_skip" }]);
@@ -362,8 +372,7 @@ async function showTripsForView(chatId, session) {
   trips.slice(0, 30).forEach((t) => {
     if (!t || !t.id) return;
     session.viewChoices[t.id] = t;
-    const label = `🚗 ${t.name || "Без названия"}${t.date ? " · " + t.date : ""}`;
-    rows.push([{ text: label.slice(0, 60), callback_data: "view_" + t.id }]);
+    rows.push([{ text: tripLabel(t), callback_data: "view_" + t.id }]);
   });
   rows.push([{ text: "🏠 На старт", callback_data: "back_start" }]);
   const head = rows.length > 1
