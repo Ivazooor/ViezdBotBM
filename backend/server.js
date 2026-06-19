@@ -214,10 +214,15 @@ async function bmGetTrips() {
   return Array.isArray(data.trips) ? data.trips : [];
 }
 
-// Дата выезда «YYYY-MM-DD» → «ДД-ММ» (без года); иначе как есть.
+// Дата выезда «YYYY-MM-DD» → «ДД / месяц словом» (без года); иначе как есть.
+const MONTHS_RU = ["январь", "февраль", "март", "апрель", "май", "июнь",
+  "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"];
 function tripDateShort(date) {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(date || ""));
-  return m ? `${m[3]}-${m[2]}` : String(date || "");
+  if (!m) return String(date || "");
+  const day = parseInt(m[3], 10);
+  const month = MONTHS_RU[parseInt(m[2], 10) - 1] || m[2];
+  return `${day} / ${month}`;
 }
 // Подпись выезда на кнопке: «Название · ДД-ММ» (без машинки).
 function tripLabel(t) {
