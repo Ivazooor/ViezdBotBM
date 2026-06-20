@@ -211,10 +211,28 @@ async function bmApi(method, payload = {}) {
     opts.headers["Content-Type"] = "application/json";
     opts.body = JSON.stringify(payload);
   }
-  const response = await fetch(url, opts);
-  const data = await response.json().catch(() => ({}));
-  if (!data.ok) throw new Error(data.error || `api ${response.status}`);
-  return data;
+  // [B1] Устойчивость: сетевые сбои и 5xx повторяем (до 3 попыток с backoff).
+  // 4xx (401 токен, 404 выезд не найден, 400) — постоянные ошибки, повтор бессмыслен.
+  let lastErr;
+  for (let attempt = 0; attempt <= 2; attempt++) {
+    let response;
+    try {
+      response = await fetch(url, opts);
+    } catch (netErr) {
+      lastErr = new Error("сеть: " + netErr.message);
+      if (attempt < 2) { logEvent("warn", "bmApi", payload.op || method, "сеть, повтор " + (attempt + 1)); await sleep(1000 * (attempt + 1)); continue; }
+      throw lastErr;
+    }
+    if (response.status >= 500) {
+      lastErr = new Error("api " + response.status);
+      if (attempt < 2) { logEvent("warn", "bmApi", payload.op || method, "5xx, повтор " + (attempt + 1)); await sleep(1000 * (attempt + 1)); continue; }
+      throw lastErr;
+    }
+    const data = await response.json().catch(() => ({}));
+    if (!data.ok) throw new Error(data.error || `api ${response.status}`);
+    return data;
+  }
+  throw lastErr || new Error("bmApi: не удалось");
 }
 
 // Список незавершённых выездов для выбора в боте.
@@ -658,7 +676,12 @@ async function submitReport(chatId, userId, from) {
           });
         }
       } catch (error) {
-        logEvent("error", "bm final_report:", error.message);
+        logEvent("error", "bm kpi-запись:", error.message);
+        // [B1] Не молчим: отчёт ушёл в чат, но в карточку выезда (приложение) не записался.
+        await sendMessage(chatId,
+          "⚠️ Отчёт отправлен в рабочий чат, но сохранить его в приложении (карточка выезда) не удалось:\n" +
+          error.message + "\n\nДанные не потеряны — сообщите руководителю, выезд можно заполнить вручную."
+        ).catch(() => {});
       }
     }
 
@@ -789,18 +812,24 @@ async function handleMessage(message) {
       session.step = "date";
       return sendMessage(chatId, DATE_PROMPT, dateKeyboard);
 
-    case "register_fio":
-      if (!text) return sendMessage(chatId, "Введите ФИО текстом.");
-      session.profileFio = text;
+    case "register_fio": {
+      const fio = (text || "").trim();
+      if (!fio) return sendMessage(chatId, "Введите ФИО текстом (например: Иванов Иван).");
+      session.profileFio = fio;
+      let fioSaved = !bmEnabled(); // без интеграции профиль живёт в сессии — это норма
       if (bmEnabled()) {
         try {
-          await bmSaveProfile(userId, text);
+          await bmSaveProfile(userId, fio);
+          fioSaved = true;
         } catch (error) {
           logEvent("error", "bmSaveProfile:", error.message);
         }
       }
-      await sendMessage(chatId, `Спасибо, ${text}! Профиль сохранён.`);
+      await sendMessage(chatId, fioSaved
+        ? `Спасибо, ${fio}! Профиль сохранён.`
+        : `Принято: ${fio}. Сохранить профиль в приложении сейчас не удалось — использую имя в этой сессии.`);
       return showTypeMenu(chatId, session);
+    }
 
     case "date":
       if (!text) return sendMessage(chatId, "Введите дату выезда текстом.");
@@ -880,6 +909,13 @@ async function handleQualityVote(callback) {
       });
     } catch (error) {
       logEvent("error", "bm set_quality:", error.message);
+      // [B1] Не записалось в приложение — не помечаем как успешную, даём оценщику повторить (кнопки остаются).
+      await tg("answerCallbackQuery", {
+        callback_query_id: callback.id,
+        text: "⚠️ Не удалось записать оценку в приложение: " + error.message + ". Попробуйте ещё раз.",
+        show_alert: true,
+      }).catch(() => {});
+      return;
     }
   }
 
@@ -948,6 +984,13 @@ async function handleStatusVote(callback) {
       });
     } catch (error) {
       logEvent("error", "bm set_board:", error.message);
+      // [B1] Не записалось — не помечаем, даём повторить (кнопки остаются).
+      await tg("answerCallbackQuery", {
+        callback_query_id: callback.id,
+        text: "⚠️ Не удалось записать статус в приложение: " + error.message + ". Попробуйте ещё раз.",
+        show_alert: true,
+      }).catch(() => {});
+      return;
     }
   }
 
