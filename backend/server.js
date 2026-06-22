@@ -261,10 +261,13 @@ function tripDateShort(date) {
   const month = MONTHS_RU[parseInt(m[2], 10) - 1] || m[2];
   return `${day} / ${month}`;
 }
-// Подпись выезда на кнопке: «Название · ДД-ММ» (без машинки).
+// Подпись выезда на кнопке: «Название / Ответственный / ДД месяц» (без машинки).
 function tripLabel(t) {
+  const parts = [t.name || "Без названия"];
+  if (t.responsible) parts.push(t.responsible);
   const d = tripDateShort(t.date);
-  return `${t.name || "Без названия"}${d ? " · " + d : ""}`.slice(0, 64);
+  if (d) parts.push(d);
+  return parts.join(" / ").slice(0, 64);
 }
 
 // ===== Клавиатуры =====
