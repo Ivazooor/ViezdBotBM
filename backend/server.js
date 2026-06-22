@@ -261,10 +261,10 @@ function tripDateShort(date) {
   const month = MONTHS_RU[parseInt(m[2], 10) - 1] || m[2];
   return `${day} / ${month}`;
 }
-// Подпись выезда на кнопке: «Название / Ответственный / ДД месяц» (без машинки).
+// Подпись выезда на кнопке: «Название / Фамилия / ДД месяц» (без машинки).
 function tripLabel(t) {
   const parts = [t.name || "Без названия"];
-  if (t.responsible) parts.push(t.responsible);
+  if (t.responsible) parts.push(String(t.responsible).trim().split(/\s+/)[0]); // только фамилия
   const d = tripDateShort(t.date);
   if (d) parts.push(d);
   return parts.join(" / ").slice(0, 64);
