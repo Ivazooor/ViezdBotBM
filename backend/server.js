@@ -230,7 +230,7 @@ async function bmApi(method, payload = {}) {
       throw lastErr;
     }
     const data = await response.json().catch(() => ({}));
-    if (!data.ok) throw new Error(data.error || `api ${response.status}`);
+    if (!data.ok) { const e = new Error(data.error || `api ${response.status}`); if (data.code) e.code = data.code; throw e; }
     return data;
   }
   throw lastErr || new Error("bmApi: не удалось");
@@ -612,6 +612,21 @@ async function submitReport(chatId, userId, from) {
   }
   logEvent("info", `Переслано ${sent}/${total0}, ошибок ${failed}`);
 
+  // Предварительный отчёт: пометить карточку выезда в приложении (если выезд выбран из списка).
+  // Бот отмечает trip.checks.prelim → в KPI-приложении видно «Предварительный отчёт ✓».
+  if (d.reportType !== "final" && bmEnabled() && d.tripId) {
+    try {
+      await bmApi("POST", { op: "preliminary", tripId: d.tripId, by: senderName(from) });
+      logEvent("info", "Отметка предварительного отчёта поставлена, tripId=" + d.tripId);
+    } catch (error) {
+      logEvent("error", "bm preliminary mark:", error.message);
+      await sendMessage(chatId,
+        "⚠️ Предварительный отчёт отправлен в чат, но отметку в приложении поставить не удалось:\n" +
+        error.message + "\n\nСообщите руководителю — отметку можно поставить вручную в карточке выезда."
+      ).catch(() => {});
+    }
+  }
+
   // Фирменный PDF-отчёт для заказчика — только по заключительному выезду.
   let pdfNote = "";
   if (d.reportType === "final") {
@@ -913,10 +928,14 @@ async function handleQualityVote(callback) {
       });
     } catch (error) {
       logEvent("error", "bm set_quality:", error.message);
-      // [B1] Не записалось в приложение — не помечаем как успешную, даём оценщику повторить (кнопки остаются).
+      // Правило приложения (HTTP 409): «качественный» нельзя без предв. И заключ. отчёта —
+      // показываем причину как есть, кнопки оставляем (можно выбрать «не качественный»).
+      const ruleBlock = error.code === 'reports_required' || /отч[её]т/i.test(error.message);
       await tg("answerCallbackQuery", {
         callback_query_id: callback.id,
-        text: "⚠️ Не удалось записать оценку в приложение: " + error.message + ". Попробуйте ещё раз.",
+        text: ruleBlock
+          ? "⚠️ " + error.message
+          : "⚠️ Не удалось записать оценку в приложение: " + error.message + ". Попробуйте ещё раз.",
         show_alert: true,
       }).catch(() => {});
       return;
