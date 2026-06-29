@@ -267,7 +267,12 @@ function tripLabel(t) {
   if (t.responsible) parts.push(String(t.responsible).trim().split(/\s+/)[0]); // только фамилия
   const d = tripDateShort(t.date);
   if (d) parts.push(d);
-  return parts.join(" / ").slice(0, 64);
+  let label = parts.join(" / ").slice(0, 54);
+  // Маркер уже полученных отчётов: подсказывает выбрать ТУ ЖЕ карточку для заключительного отчёта,
+  // что и для предварительного — иначе отметки разойдутся по разным выездам и «качественный» не откроется.
+  if (t.final) label += " ✅✅отчёты";
+  else if (t.prelim) label += " ✅предв.";
+  return label.slice(0, 64);
 }
 
 // ===== Клавиатуры =====
@@ -618,6 +623,9 @@ async function submitReport(chatId, userId, from) {
     try {
       await bmApi("POST", { op: "preliminary", tripId: d.tripId, by: senderName(from) });
       logEvent("info", "Отметка предварительного отчёта поставлена, tripId=" + d.tripId);
+      await sendMessage(chatId,
+        `✅ Бот отметил в карточке выезда${d.tripName ? " «" + d.tripName + "»" : ""}: предварительный отчёт получен.`
+      ).catch(() => {});
     } catch (error) {
       logEvent("error", "bm preliminary mark:", error.message);
       await sendMessage(chatId,
@@ -625,6 +633,12 @@ async function submitReport(chatId, userId, from) {
         error.message + "\n\nСообщите руководителю — отметку можно поставить вручную в карточке выезда."
       ).catch(() => {});
     }
+  } else if (d.reportType !== "final" && bmEnabled() && !d.tripId) {
+    // Выезд не выбран из списка → отмечать нечего. Предупреждаем сразу, чтобы «качественный» потом не оказался заблокирован.
+    await sendMessage(chatId,
+      "⚠️ Выезд не был выбран из списка, поэтому отметка «предварительный отчёт получен» в карточке не проставлена.\n\n" +
+      "Чтобы выезд можно было отметить «качественным», отправьте предварительный отчёт ещё раз через /start и выберите выезд из списка."
+    ).catch(() => {});
   }
 
   // Фирменный PDF-отчёт для заказчика — только по заключительному выезду.
@@ -684,6 +698,11 @@ async function submitReport(chatId, userId, from) {
             by: senderName(from),
           });
           kpiTripId = created.id || null;
+          // Новая карточка → есть только заключительный отчёт; предупреждаем, иначе «качественный» будет заблокирован.
+          await sendMessage(chatId,
+            `✅ Создана карточка выезда «${d.projectName}» с отметкой «заключительный отчёт получен».\n\n` +
+            "⚠️ В этой карточке нет предварительного отчёта — «качественный» откроется только после того, как по этому же выезду поступит и предварительный отчёт."
+          ).catch(() => {});
         } else if (kpiTripId) {
           await bmApi("POST", {
             op: "final_report",
@@ -693,6 +712,15 @@ async function submitReport(chatId, userId, from) {
             recommendations: d.recommendations,
             by: senderName(from),
           });
+          await sendMessage(chatId,
+            `✅ Бот отметил в карточке выезда${d.tripName ? " «" + d.tripName + "»" : ""}: заключительный отчёт получен.`
+          ).catch(() => {});
+        } else {
+          // Выезд не выбран и карточка не создана → отмечать нечего. Сообщаем, чтобы отметку не искали зря.
+          await sendMessage(chatId,
+            "⚠️ Выезд не был выбран из списка, поэтому отметка «заключительный отчёт получен» в карточке не проставлена.\n\n" +
+            "Отправьте заключительный отчёт ещё раз через /start и выберите выезд из списка (тот же, что и для предварительного отчёта)."
+          ).catch(() => {});
         }
       } catch (error) {
         logEvent("error", "bm kpi-запись:", error.message);
