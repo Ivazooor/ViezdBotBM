@@ -281,6 +281,7 @@ const typeKeyboard = {
     [{ text: "🟦 Предварительный отчет", callback_data: "type_pre" }],
     [{ text: "✅ Заключительный отчет", callback_data: "type_final" }],
     [{ text: "👁 Посмотреть выезды", callback_data: "view_trips" }],
+    [{ text: "📊 Сводка за месяц", callback_data: "summary_menu" }],
   ],
 };
 const checklistKeyboard = {
@@ -524,6 +525,75 @@ async function showTripDetails(chatId, session, tripId) {
       [{ text: "🏠 На старт", callback_data: "back_start" }],
     ],
   });
+}
+
+// [MONTH-SUMMARY] Сводка выездов за месяц (текстом в чат): список + какие отчёты по каждому.
+async function bmMonthSummary(month) {
+  const data = await bmApi("GET", { op: "month_summary", month });
+  return Array.isArray(data.trips) ? data.trips : [];
+}
+function mskYearMonth() {
+  const parts = new Intl.DateTimeFormat("ru-RU", { timeZone: "Europe/Moscow", year: "numeric", month: "2-digit" }).formatToParts(new Date());
+  return {
+    y: parseInt(parts.find((x) => x.type === "year").value, 10),
+    mo: parseInt(parts.find((x) => x.type === "month").value, 10),
+  };
+}
+const summaryBackKb = {
+  inline_keyboard: [
+    [{ text: "◀️ Выбрать другой месяц", callback_data: "summary_menu" }],
+    [{ text: "🏠 На старт", callback_data: "back_start" }],
+  ],
+};
+async function showSummaryMenu(chatId) {
+  if (!bmEnabled()) {
+    await sendMessage(chatId, "Сводка недоступна: интеграция с приложением не настроена.");
+    return;
+  }
+  const { y, mo } = mskYearMonth();
+  const rows = [];
+  for (let i = 0; i < 6; i++) {
+    let yy = y, m2 = mo - i;
+    while (m2 <= 0) { m2 += 12; yy -= 1; }
+    const ym = yy + "-" + String(m2).padStart(2, "0");
+    rows.push([{ text: MONTHS_RU[m2 - 1] + " " + yy, callback_data: "sum_" + ym }]);
+  }
+  rows.push([{ text: "🏠 На старт", callback_data: "back_start" }]);
+  await sendMessage(chatId, "📊 Выберите месяц — покажу список выездов и какие по ним отчёты:", { inline_keyboard: rows });
+}
+async function showMonthSummary(chatId, month) {
+  if (!/^\d{4}-\d{2}$/.test(month)) {
+    await sendMessage(chatId, "Неверный месяц.", summaryBackKb);
+    return;
+  }
+  let trips = [];
+  try {
+    trips = await bmMonthSummary(month);
+  } catch (error) {
+    logEvent("error", "bmMonthSummary:", error.message);
+    await sendMessage(chatId, "⚠️ Не удалось получить сводку из приложения. Попробуйте позже.", summaryBackKb);
+    return;
+  }
+  const [yy, mm] = month.split("-");
+  const title = "📊 Сводка за " + (MONTHS_RU[parseInt(mm, 10) - 1] || mm) + " " + yy;
+  if (!trips.length) {
+    await sendMessage(chatId, title + "\n\nВыездов за этот месяц нет.", summaryBackKb);
+    return;
+  }
+  const statusRu = { planned: "🟦 Запланирован", paused: "⏸ На паузе", bad: "❌ Брак", done: "✅ Выполнен" };
+  let doneCount = 0;
+  const lines = [];
+  trips.forEach((t, i) => {
+    if (t.status === "done") doneCount++;
+    const rep = (t.prelim ? "предв.✅" : "предв.❌") + "  " + (t.final ? "заключ.✅" : "заключ.❌") + (t.quality === "yes" ? "  качество✅" : "");
+    const dd = tripDateShort(t.date);
+    lines.push(`${i + 1}. ${t.name || "Без названия"}${t.responsible ? " · " + t.responsible : ""}${dd ? " · " + dd : ""}`);
+    lines.push(`    ${statusRu[t.status] || t.status} · ${rep}`);
+  });
+  const head = [title, `Всего выездов: ${trips.length} · выполнено: ${doneCount}`, ""];
+  let text = head.concat(lines).join("\n");
+  if (text.length > 4000) text = text.slice(0, 3980) + "\n… (список обрезан)";
+  await sendMessage(chatId, text, summaryBackKb);
 }
 
 // Поля отчёта, зависящие от типа (для сводки и заголовка в чате).
@@ -1094,6 +1164,15 @@ async function handleCallback(callback) {
   }
   if (data.startsWith("view_")) {
     await showTripDetails(chatId, session, data.slice(5));
+    return;
+  }
+  // [MONTH-SUMMARY] Сводка за месяц
+  if (data === "summary_menu") {
+    await showSummaryMenu(chatId);
+    return;
+  }
+  if (data.startsWith("sum_")) {
+    await showMonthSummary(chatId, data.slice(4));
     return;
   }
   if (data === "back_start") {
