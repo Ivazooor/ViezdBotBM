@@ -75,6 +75,13 @@ const CHECKLISTS = {
 // ===== Состояние диалогов (FSM) в памяти, по Telegram ID =====
 const sessions = new Map();
 
+// [BAD-REASON] Ожидание причины «не качественный» в рабочем чате: оценщик нажал «⚠️ Не качественный»
+// (или «⚠️ Не выполнен») → бот просит причину; принимаем Reply на запрос ИЛИ следующее текстовое
+// сообщение ТОГО ЖЕ оценщика. Ключ — chatId (в чате ждём одну причину; новая кнопка перезаписывает).
+// Хранится в памяти: рестарт бота сбрасывает ожидание — кнопки оценки остаются, можно нажать заново.
+const pendingBadReasons = new Map();
+const BAD_REASON_TTL_MS = 15 * 60 * 1000; // 15 минут на ввод причины
+
 function resetSession(userId) {
   sessions.set(userId, { step: "idle", data: {}, media: [], mediaHintShown: false, submitting: false });
   return sessions.get(userId);
@@ -858,8 +865,13 @@ async function handleMessage(message) {
   const chatId = message.chat.id;
   const userId = message.from.id;
 
-  // Работаем только в личной переписке с сотрудником.
-  if (message.chat.type !== "private") return;
+  // [BAD-REASON] Рабочая группа: ловим причину «не качественный» от оценщика; прочие сообщения групп игнорируем.
+  if (message.chat.type !== "private") {
+    if (String(chatId) === String(TARGET_CHAT_ID)) {
+      try { await maybeHandleBadReason(message); } catch (error) { logEvent("error", "badReason:", error.message); }
+    }
+    return;
+  }
 
   if (!isAllowed(userId)) {
     await sendMessage(
@@ -996,6 +1008,81 @@ async function handleMessage(message) {
 }
 
 // ===== Обработка нажатий на кнопки =====
+// [BAD-REASON] «Не качественный»/«Не выполнен» → сперва причина из чата, оценка запишется после её получения.
+// Кнопки исходного сообщения НЕ убираем до записи: если причина не пришла (TTL/рестарт бота) — жмут заново.
+async function requestBadReason(callback, { kind, tripId }) {
+  const msg = callback.message;
+  let ask = null;
+  try {
+    ask = await sendMessage(
+      msg.chat.id,
+      `⚠️ ${senderName(callback.from)}, укажите причину — почему выезд не качественный?\n\n` +
+        `Ответьте (Reply) на это сообщение или просто напишите причину следующим сообщением. ` +
+        `Причина попадёт в карточку выезда, карточка будет перемещена в «Брак».`
+    );
+  } catch (error) {
+    logEvent("error", "requestBadReason:", error.message);
+  }
+  pendingBadReasons.set(String(msg.chat.id), {
+    kind,                                   // 'quality' (кнопка оценки) | 'board' (кнопка статуса)
+    tripId,
+    reviewerId: callback.from.id,
+    reviewerName: senderName(callback.from),
+    requestMsgId: ask && ask.message_id,
+    voteChatId: msg.chat.id,
+    voteMsgId: msg.message_id,
+    voteText: msg.text || "",
+    ts: Date.now(),
+  });
+  await tg("answerCallbackQuery", {
+    callback_query_id: callback.id,
+    text: "Напишите причину в чате — после этого оценка запишется.",
+  }).catch(() => {});
+}
+
+// [BAD-REASON] Приём причины в рабочем чате. Возвращает true, если сообщение обработано как причина.
+async function maybeHandleBadReason(message) {
+  const key = String(message.chat.id);
+  const p = pendingBadReasons.get(key);
+  if (!p) return false;
+  if (Date.now() - p.ts > BAD_REASON_TTL_MS) { pendingBadReasons.delete(key); return false; } // протухло — кнопки живы, жмут заново
+  const isReply = !!(message.reply_to_message && p.requestMsgId && message.reply_to_message.message_id === p.requestMsgId);
+  const fromReviewer = !!(message.from && message.from.id === p.reviewerId);
+  if (!isReply && !fromReviewer) return false;          // чужие сообщения в чате не трогаем
+  const text = (message.text || "").trim();
+  if (!text) {                                          // фото/стикер вместо текста
+    if (isReply) await sendMessage(message.chat.id, "Пришлите причину текстом, пожалуйста.").catch(() => {});
+    return isReply;
+  }
+  const reason = text.slice(0, 2000);
+  try {
+    if (p.kind === "board") {
+      await bmApi("POST", { op: "set_board", tripId: p.tripId, status: "bad", reason, by: p.reviewerName });
+    } else {
+      await bmApi("POST", { op: "set_quality", tripId: p.tripId, quality: "no", reason, by: p.reviewerName });
+    }
+  } catch (error) {
+    logEvent("error", "bm bad reason:", error.message);
+    pendingBadReasons.delete(key);
+    await sendMessage(message.chat.id, "⚠️ Не удалось записать оценку в приложение: " + error.message + ". Нажмите кнопку оценки ещё раз.").catch(() => {});
+    return true;
+  }
+  pendingBadReasons.delete(key);
+  // Фиксируем оценку и причину в исходном сообщении с кнопками (кнопки убираются).
+  const isBoard = p.kind === "board";
+  const splitKey = isBoard ? "\n\n— Статус —" : "\n\n— Оценка —";
+  const baseText = (p.voteText || "").split(splitKey)[0] || (isBoard ? "Отмечаем что выезд выполнен?" : "🔎 Оценка качества выезда");
+  const mark = isBoard ? "— Статус —\n⚠️ Выезд отмечен как БРАК" : "— Оценка —\n⚠️ Выезд отмечен как НЕ качественный";
+  const newText = `${baseText}\n\n${mark}\nПричина: ${reason}\nОценил: ${p.reviewerName} · ${nowMoscow()}`;
+  try {
+    await tg("editMessageText", { chat_id: p.voteChatId, message_id: p.voteMsgId, text: newText });
+  } catch (error) {
+    await tg("editMessageReplyMarkup", { chat_id: p.voteChatId, message_id: p.voteMsgId }).catch(() => {});
+  }
+  await sendMessage(message.chat.id, "✅ Причина записана в карточку выезда. Карточка перемещена в «Брак».").catch(() => {});
+  return true;
+}
+
 // Оценка качества выезда кнопками в рабочем чате. Реагирует только на оценщиков;
 // остальным — всплывающее уведомление, сообщение не меняется.
 async function handleQualityVote(callback) {
@@ -1015,6 +1102,11 @@ async function handleQualityVote(callback) {
   // tripId передаётся в callback после «|», если выезд был привязан к карточке.
   const tripId = callback.data.includes("|") ? callback.data.split("|")[1] : null;
 
+  // [BAD-REASON] «Не качественный» → сперва спрашиваем причину в чате; оценка запишется после её получения.
+  if (!good && bmEnabled() && tripId) {
+    return requestBadReason(callback, { kind: "quality", tripId });
+  }
+
   // Запись оценки в карточку выезда KPI-приложения.
   if (bmEnabled() && tripId) {
     try {
@@ -1024,6 +1116,7 @@ async function handleQualityVote(callback) {
         quality: good ? "yes" : "no",
         by: senderName(callback.from),
       });
+      pendingBadReasons.delete(String(msg.chat.id)); // [BAD-REASON] «качественный» отменяет незакрытый запрос причины
     } catch (error) {
       logEvent("error", "bm set_quality:", error.message);
       // Правило приложения (HTTP 409): «качественный» нельзя без предв. И заключ. отчёта —
@@ -1094,6 +1187,11 @@ async function handleStatusVote(callback) {
   const done = callback.data.startsWith("done_ok");
   const tripId = callback.data.includes("|") ? callback.data.split("|")[1] : null;
 
+  // [BAD-REASON] «Не выполнен» = брак → сперва причина из чата (как у кнопки «Не качественный»).
+  if (!done && bmEnabled() && tripId) {
+    return requestBadReason(callback, { kind: "board", tripId });
+  }
+
   // Меняем статус выезда в карточке: done → «Выполнено», bad → «Брак».
   if (bmEnabled() && tripId) {
     try {
@@ -1103,6 +1201,7 @@ async function handleStatusVote(callback) {
         status: done ? "done" : "bad",
         by: senderName(callback.from),
       });
+      pendingBadReasons.delete(String(msg.chat.id)); // [BAD-REASON] «выполнен» отменяет незакрытый запрос причины
     } catch (error) {
       logEvent("error", "bm set_board:", error.message);
       // [B1] Не записалось — не помечаем, даём повторить (кнопки остаются).
