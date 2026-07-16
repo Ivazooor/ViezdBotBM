@@ -76,11 +76,23 @@ const CHECKLISTS = {
 const sessions = new Map();
 
 // [BAD-REASON] Ожидание причины «не качественный» в рабочем чате: оценщик нажал «⚠️ Не качественный»
-// (или «⚠️ Не выполнен») → бот просит причину; принимаем Reply на запрос ИЛИ следующее текстовое
-// сообщение ТОГО ЖЕ оценщика. Ключ — chatId (в чате ждём одну причину; новая кнопка перезаписывает).
+// (или «⚠️ Не выполнен») → бот просит причину; принимаем Reply на ЕГО запрос ИЛИ следующее текстовое
+// сообщение ТОГО ЖЕ оценщика. Структура: Map chatId → Map reviewerId → pending — у КАЖДОГО оценщика
+// свой независимый слот (двое могут параллельно оценивать разные выезды, не затирая друг друга).
 // Хранится в памяти: рестарт бота сбрасывает ожидание — кнопки оценки остаются, можно нажать заново.
 const pendingBadReasons = new Map();
 const BAD_REASON_TTL_MS = 15 * 60 * 1000; // 15 минут на ввод причины
+function badReasonChatMap(chatId) {
+  const key = String(chatId);
+  if (!pendingBadReasons.has(key)) pendingBadReasons.set(key, new Map());
+  return pendingBadReasons.get(key);
+}
+// Снять ожидание причины конкретного оценщика по конкретному выезду (после успешной «хорошей» оценки).
+function clearBadReasonPending(chatId, reviewerId, tripId) {
+  const m = badReasonChatMap(chatId);
+  const p = m.get(reviewerId);
+  if (p && (!tripId || p.tripId === tripId)) m.delete(reviewerId);
+}
 
 function resetSession(userId) {
   sessions.set(userId, { step: "idle", data: {}, media: [], mediaHintShown: false, submitting: false });
@@ -587,7 +599,8 @@ async function showMonthSummary(chatId, month) {
     await sendMessage(chatId, title + "\n\nВыездов за этот месяц нет.", summaryBackKb);
     return;
   }
-  const statusRu = { planned: "🟦 Запланирован", paused: "⏸ На паузе", bad: "❌ Брак", done: "✅ Выполнен" };
+  // [REVIEW-COL] + новые статусы доски KPI: incoming/clarify (заявки) и review (работы завершены — на оценке)
+  const statusRu = { incoming: "📥 Входящий запрос", clarify: "❓ На уточнении", planned: "🟦 Запланирован", review: "📝 На оценке", paused: "⏸ На паузе", bad: "❌ Брак", done: "✅ Выполнен" };
   let doneCount = 0;
   const lines = [];
   trips.forEach((t, i) => {
@@ -1023,7 +1036,13 @@ async function requestBadReason(callback, { kind, tripId }) {
   } catch (error) {
     logEvent("error", "requestBadReason:", error.message);
   }
-  pendingBadReasons.set(String(msg.chat.id), {
+  const chatMap = badReasonChatMap(msg.chat.id);
+  const prev = chatMap.get(callback.from.id);
+  if (prev && prev.tripId !== tripId && Date.now() - prev.ts <= BAD_REASON_TTL_MS) {
+    // [REVIEW-168] У оценщика уже открыт запрос по ДРУГОМУ выезду — прежний аннулируем ЯВНО (не молча).
+    await sendMessage(msg.chat.id, `ℹ️ ${senderName(callback.from)}, прежний запрос причины отменён — теперь жду причину по новой оценке. Прежнюю оценку можно поставить заново кнопкой.`).catch(() => {});
+  }
+  chatMap.set(callback.from.id, {
     kind,                                   // 'quality' (кнопка оценки) | 'board' (кнопка статуса)
     tripId,
     reviewerId: callback.from.id,
@@ -1041,18 +1060,36 @@ async function requestBadReason(callback, { kind, tripId }) {
 }
 
 // [BAD-REASON] Приём причины в рабочем чате. Возвращает true, если сообщение обработано как причина.
+// [REVIEW-168] Матчинг: Reply на КОНКРЕТНЫЙ запрос → тот pending (любой автор — явный адресат);
+// без Reply → только СВОЙ pending отправителя. Reply на постороннее сообщение — НЕ причина.
+// Команды («/…») — не причина. Текст «отмена»/«-» — отменить запрос без записи оценки.
 async function maybeHandleBadReason(message) {
-  const key = String(message.chat.id);
-  const p = pendingBadReasons.get(key);
-  if (!p) return false;
-  if (Date.now() - p.ts > BAD_REASON_TTL_MS) { pendingBadReasons.delete(key); return false; } // протухло — кнопки живы, жмут заново
-  const isReply = !!(message.reply_to_message && p.requestMsgId && message.reply_to_message.message_id === p.requestMsgId);
-  const fromReviewer = !!(message.from && message.from.id === p.reviewerId);
-  if (!isReply && !fromReviewer) return false;          // чужие сообщения в чате не трогаем
+  const chatMap = badReasonChatMap(message.chat.id);
+  if (!chatMap.size) return false;
+  // чистим протухшие (кнопки живы — жмут заново)
+  for (const [rid, pp] of chatMap) { if (Date.now() - pp.ts > BAD_REASON_TTL_MS) chatMap.delete(rid); }
+  if (!chatMap.size) return false;
+  let p = null, isReply = false;
+  if (message.reply_to_message) {
+    // Reply: принимаем ТОЛЬКО если это ответ на один из НАШИХ запросов причины (иначе это чужой разговор)
+    for (const pp of chatMap.values()) {
+      if (pp.requestMsgId && message.reply_to_message.message_id === pp.requestMsgId) { p = pp; isReply = true; break; }
+    }
+    if (!p) return false;                               // reply на постороннее сообщение — не причина
+  } else {
+    p = message.from ? chatMap.get(message.from.id) : null; // без reply — только свой запрос
+    if (!p) return false;
+  }
   const text = (message.text || "").trim();
   if (!text) {                                          // фото/стикер вместо текста
     if (isReply) await sendMessage(message.chat.id, "Пришлите причину текстом, пожалуйста.").catch(() => {});
     return isReply;
+  }
+  if (text.startsWith("/")) return false;               // команды бота — не причина
+  if (/^(отмена|-|отменить)$/i.test(text)) {            // явная отмена запроса причины
+    chatMap.delete(p.reviewerId);
+    await sendMessage(message.chat.id, "ℹ️ Запрос причины отменён — оценка не записана, кнопки остаются активными.").catch(() => {});
+    return true;
   }
   const reason = text.slice(0, 2000);
   try {
@@ -1063,11 +1100,11 @@ async function maybeHandleBadReason(message) {
     }
   } catch (error) {
     logEvent("error", "bm bad reason:", error.message);
-    pendingBadReasons.delete(key);
+    chatMap.delete(p.reviewerId);
     await sendMessage(message.chat.id, "⚠️ Не удалось записать оценку в приложение: " + error.message + ". Нажмите кнопку оценки ещё раз.").catch(() => {});
     return true;
   }
-  pendingBadReasons.delete(key);
+  chatMap.delete(p.reviewerId);
   // Фиксируем оценку и причину в исходном сообщении с кнопками (кнопки убираются).
   const isBoard = p.kind === "board";
   const splitKey = isBoard ? "\n\n— Статус —" : "\n\n— Оценка —";
@@ -1077,6 +1114,7 @@ async function maybeHandleBadReason(message) {
   try {
     await tg("editMessageText", { chat_id: p.voteChatId, message_id: p.voteMsgId, text: newText });
   } catch (error) {
+    logEvent("error", "editMessageText(badReason):", error.message); // [REVIEW-168] сбой не глотаем молча
     await tg("editMessageReplyMarkup", { chat_id: p.voteChatId, message_id: p.voteMsgId }).catch(() => {});
   }
   await sendMessage(message.chat.id, "✅ Причина записана в карточку выезда. Карточка перемещена в «Брак».").catch(() => {});
@@ -1116,9 +1154,12 @@ async function handleQualityVote(callback) {
         quality: good ? "yes" : "no",
         by: senderName(callback.from),
       });
-      pendingBadReasons.delete(String(msg.chat.id)); // [BAD-REASON] «качественный» отменяет незакрытый запрос причины
+      clearBadReasonPending(msg.chat.id, callback.from.id, tripId); // [BAD-REASON] «качественный» по ЭТОМУ выезду отменяет СВОЙ запрос причины (чужие не трогаем)
     } catch (error) {
       logEvent("error", "bm set_quality:", error.message);
+      // [REVIEW-168] Оценщик явно переключился на «качественный» — его незакрытый запрос причины по этому
+      // выезду снимаем ДАЖЕ при отказе (409): иначе его следующее сообщение в чат ушло бы причиной брака.
+      clearBadReasonPending(msg.chat.id, callback.from.id, tripId);
       // Правило приложения (HTTP 409): «качественный» нельзя без предв. И заключ. отчёта —
       // показываем причину как есть, кнопки оставляем (можно выбрать «не качественный»).
       const ruleBlock = error.code === 'reports_required' || /отч[её]т/i.test(error.message);
@@ -1201,7 +1242,7 @@ async function handleStatusVote(callback) {
         status: done ? "done" : "bad",
         by: senderName(callback.from),
       });
-      pendingBadReasons.delete(String(msg.chat.id)); // [BAD-REASON] «выполнен» отменяет незакрытый запрос причины
+      clearBadReasonPending(msg.chat.id, callback.from.id, tripId); // [BAD-REASON] «выполнен» по ЭТОМУ выезду отменяет СВОЙ запрос причины (чужие не трогаем)
     } catch (error) {
       logEvent("error", "bm set_board:", error.message);
       // [B1] Не записалось — не помечаем, даём повторить (кнопки остаются).
