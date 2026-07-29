@@ -479,29 +479,39 @@ function goAfterResponsible(chatId, session) {
       session.data.tripTasks ? useTasksDoneKeyboard : undefined
     );
   }
+  // Предварительный отчёт: задачи уже известны — они либо взяты из карточки выезда,
+  // либо введены при заведении нового выезда. Отдельно спрашивать их не нужно.
+  if (session.data.tripTasks) {
+    session.data.comment = session.data.tripTasks;
+    session.step = "media";
+    return sendMessage(chatId, MEDIA_PROMPT, mediaKeyboard);
+  }
+  // Задач нет только в запасном сценарии (приложение недоступно) — тогда спрашиваем.
   session.step = "comment";
-  return sendMessage(
-    chatId,
-    session.data.tripTasks
-      ? `Задачи из карточки выезда подставлены:\n${session.data.tripTasks}\n\nОтправьте свой текст, чтобы изменить, или «Использовать задачи» — чтобы вставить задачи из карточки.`
-      : "Укажите перечень задач на данном выезде или нажмите «Пропустить».",
-    session.data.tripTasks ? useTasksKeyboard : commentKeyboard
-  );
+  return sendMessage(chatId, "Укажите перечень задач на данном выезде или нажмите «Пропустить».", commentKeyboard);
 }
 
 // Вторым действием после выбора типа — выбор выезда из отдела «Выезды».
 async function offerTripChoice(chatId, session) {
-  const isFinal = session.data.reportType === "final";
-  // Интеграция не настроена (нет токена) — идём по старому сценарию без привязки.
-  if (!bmEnabled()) return goChecklist(chatId, session);
+  // Интеграция не настроена (нет токена) — карточку завести негде, но название и задачи
+  // всё равно нужны: без них отчёт уходит в чат и в PDF заказчику с пустым «Проект:».
+  if (!bmEnabled()) return askNewTripName(chatId, session);
 
   let trips = [];
   try {
     trips = await bmGetTrips();
   } catch (error) {
     logEvent("error", "bmGetTrips:", error.message);
-    await sendMessage(chatId, "⚠️ Не удалось получить список выездов из приложения. Продолжаем без привязки.");
-    return goChecklist(chatId, session);
+    // Не уводим сразу в «новый выезд»: при короткой сетевой икоте так появился бы дубль карточки
+    // уже существующего выезда. Даём выбор — повторить список или всё же завести новый.
+    session.step = "picktrip";
+    await sendMessage(chatId,
+      "⚠️ Не удалось получить список выездов из приложения.\n\nПопробуйте ещё раз — или заведите новый выезд, если его в списке и не было.",
+      { inline_keyboard: [
+        [{ text: "🔄 Повторить список", callback_data: "pick_retry" }],
+        [{ text: "➕ Завести новый выезд", callback_data: "pick_create" }],
+      ] });
+    return;
   }
 
   session.tripChoices = {};
@@ -511,14 +521,29 @@ async function offerTripChoice(chatId, session) {
     session.tripChoices[t.id] = t;
     rows.push([{ text: tripLabel(t), callback_data: "pick_" + t.id }]);
   });
-  if (isFinal) rows.push([{ text: "➕ Создать карточку", callback_data: "pick_create" }]);
-  rows.push([{ text: "⏭ Пропустить", callback_data: "pick_skip" }]);
+  // Выезда нет в списке — заводим новый прямо здесь: название и задачи спросим сразу,
+  // карточка появится в приложении при отправке отчёта. Кнопки «Пропустить» больше нет:
+  // отчёт без привязки к выезду не отмечался в карточке и терялся для приложения.
+  rows.push([{ text: "➕ Новый выезд — нет в списке", callback_data: "pick_create" }]);
 
   session.step = "picktrip";
   const head = rows.length > 1
-    ? "Выберите выезд из отдела «Выезды»:"
-    : "Незавершённых выездов в приложении нет. Можно продолжить без привязки.";
+    ? "Выберите выезд из отдела «Выезды» или заведите новый:"
+    : "Незавершённых выездов в приложении нет — заведите новый.";
   await sendMessage(chatId, head, { inline_keyboard: rows });
+}
+
+// ===== Новый выезд: название → задачи (оба поля обязательны) =====
+function askNewTripName(chatId, session) {
+  session.step = "newtrip_name";
+  // Без связи с приложением карточка не заведётся — не обещаем того, чего не будет.
+  return sendMessage(chatId, bmEnabled()
+    ? "Как называется выезд? Напишите название — оно станет названием карточки в приложении.\n\nНапример: ЖК «Прайм Парк», макет 1:500"
+    : "Как называется выезд? Напишите название — оно попадёт в заголовок отчёта.\n\nНапример: ЖК «Прайм Парк», макет 1:500");
+}
+function askNewTripTasks(chatId, session) {
+  session.step = "newtrip_tasks";
+  return sendMessage(chatId, `Выезд: ${session.data.tripName}\n\nЧто нужно сделать на выезде? Перечислите задачи — они ${bmEnabled() ? "попадут в карточку выезда" : "войдут в отчёт"}.`);
 }
 
 // ===== Режим просмотра выездов (кнопка «Посмотреть выезды» в стартовом меню) =====
@@ -741,9 +766,32 @@ async function submitReport(chatId, userId, from) {
 
   // Предварительный отчёт: пометить карточку выезда в приложении (если выезд выбран из списка).
   // Бот отмечает trip.checks.prelim → в KPI-приложении видно «Предварительный отчёт ✓».
+  // Новый выезд в предварительном отчёте: сначала заводим карточку, потом ставим отметку.
+  if (d.reportType !== "final" && bmEnabled() && !d.tripId && d.tripCreate) {
+    try {
+      const created = await bmApi("POST", {
+        op: "create",
+        kind: "prelim",              // карточка заводится по ПРЕДВАРИТЕЛЬНОМУ отчёту
+        name: d.projectName || d.tripName,
+        date: d.visitDate,
+        comment: d.tripTasks || d.comment || "",
+        by: senderName(from),
+      });
+      if (created && created.id) {
+        d.tripId = created.id;
+        await sendMessage(chatId, `✅ В приложении создана карточка выезда «${d.projectName || d.tripName}» с задачами.`).catch(() => {});
+      }
+    } catch (error) {
+      logEvent("error", "bm create (pre):", error.message);
+      await sendMessage(chatId,
+        "⚠️ Отчёт отправлен в чат, но карточку выезда в приложении создать не удалось:\n" + error.message +
+        "\n\nСообщите руководителю — карточку можно завести вручную."
+      ).catch(() => {});
+    }
+  }
   if (d.reportType !== "final" && bmEnabled() && d.tripId) {
     try {
-      await bmApi("POST", { op: "preliminary", tripId: d.tripId, by: senderName(from) });
+      await bmApi("POST", { op: "preliminary", tripId: d.tripId, tasks: d.tripTasks || d.comment || "", by: senderName(from) });
       logEvent("info", "Отметка предварительного отчёта поставлена, tripId=" + d.tripId);
       await sendMessage(chatId,
         `✅ Бот отметил в карточке выезда${d.tripName ? " «" + d.tripName + "»" : ""}: предварительный отчёт получен.`
@@ -755,7 +803,7 @@ async function submitReport(chatId, userId, from) {
         error.message + "\n\nСообщите руководителю — отметку можно поставить вручную в карточке выезда."
       ).catch(() => {});
     }
-  } else if (d.reportType !== "final" && bmEnabled() && !d.tripId) {
+  } else if (d.reportType !== "final" && bmEnabled() && !d.tripId && !d.tripCreate) {
     // Выезд не выбран из списка → отмечать нечего. Предупреждаем сразу, чтобы «качественный» потом не оказался заблокирован.
     await sendMessage(chatId,
       "⚠️ Выезд не был выбран из списка, поэтому отметка «предварительный отчёт получен» в карточке не проставлена.\n\n" +
@@ -811,6 +859,7 @@ async function submitReport(chatId, userId, from) {
           // Запасная кнопка «Создать карточку» — заводим выезд из данных бота.
           const created = await bmApi("POST", {
             op: "create",
+            kind: "final",
             name: d.projectName,
             date: d.visitDate,
             comment: d.tripTasks || "",
@@ -969,6 +1018,16 @@ async function handleMessage(message) {
 
   // Приём фото/видео работает на шаге сбора файлов и на шаге сводки (можно дослать).
   const incomingMedia = message.photo || message.video || message.document || message.animation;
+  // Файл прислали раньше времени (например, на шаге названия или задач). Отвечаем ОДИН раз:
+  // альбом из десяти фото иначе давал десять одинаковых переспросов подряд.
+  if (incomingMedia && session.step !== "media" && session.step !== "confirm" && session.step !== "idle") {
+    if (!session.earlyMediaHint) {
+      session.earlyMediaHint = true;
+      await sendMessage(chatId, "Фото и видео попрошу чуть позже — сейчас ответьте текстом на вопрос выше.");
+      setTimeout(() => { const ss = sessions.get(userId); if (ss) ss.earlyMediaHint = false; }, 20000);
+    }
+    return;
+  }
   if (incomingMedia && (session.step === "media" || session.step === "confirm")) {
     // Сохраняем ссылку для пересылки (copyMessage) + file_id фото для вставки в PDF.
     const item = { chatId, messageId: message.message_id, kind: "other", fileId: null };
@@ -991,11 +1050,30 @@ async function handleMessage(message) {
   }
 
   switch (session.step) {
+    // Шаг остался для старых сообщений в истории чата (кнопка «использовать название»).
     case "project":
       if (!text) return sendMessage(chatId, "Введите наименование проекта текстом.");
       session.data.projectName = text;
       session.step = "date";
       return sendMessage(chatId, DATE_PROMPT, dateKeyboard);
+
+    // ── Новый выезд: название, затем задачи. Оба поля обязательны. ──
+    case "newtrip_name": {
+      const name = (text || "").trim();
+      if (!name) return sendMessage(chatId, "Напишите название выезда текстом — например: ЖК «Прайм Парк», макет 1:500");
+      if (name.length > 120) return sendMessage(chatId, "Слишком длинное название — уложитесь в 120 знаков.");
+      session.data.tripName = name;
+      session.data.projectName = name;      // проект = название выезда, отдельно не спрашиваем
+      return askNewTripTasks(chatId, session);
+    }
+
+    case "newtrip_tasks": {
+      const tasks = (text || "").trim();
+      if (!tasks) return sendMessage(chatId, "Перечислите задачи текстом — без них карточка выезда будет пустой.");
+      session.data.tripTasks = tasks;
+      session.data.comment = tasks;         // в отчёт идут те же задачи
+      return goChecklist(chatId, session);
+    }
 
     case "register_fio": {
       const fio = (text || "").trim();
@@ -1056,7 +1134,7 @@ async function handleMessage(message) {
       return sendMessage(chatId, "Нажмите «Подтвердить и отправить» или «Добавить ещё файлы».", confirmKeyboard);
 
     case "picktrip":
-      return sendMessage(chatId, "Выберите выезд из списка кнопкой выше (или «Пропустить»).");
+      return sendMessage(chatId, "Выберите выезд кнопкой выше или нажмите «➕ Новый выезд — нет в списке».");
 
     default:
       return sendMessage(chatId,
@@ -1342,6 +1420,18 @@ async function handleCallback(callback) {
 
   const session = getSession(userId);
 
+  // Пока бот ждёт НАЗВАНИЕ или ЗАДАЧИ, кнопки из старых сообщений не действуют. Иначе нажатие
+  // «📅 Сегодня» или «Пропустить» в прошлой переписке перепрыгивало обязательный шаг: отчёт уходил
+  // в чат с «Проект: undefined», а в приложении заводилась карточка без названия и задач.
+  // Исключения — выход из тупика: начать заново и отменить.
+  if ((session.step === "newtrip_name" || session.step === "newtrip_tasks")
+      && data !== "back_start" && data !== "cancel") {
+    await sendMessage(chatId, session.step === "newtrip_name"
+      ? "Сначала напишите название выезда текстом (или /cancel, чтобы отменить)."
+      : "Сначала перечислите задачи текстом (или /cancel, чтобы отменить).");
+    return;
+  }
+
   // Режим просмотра выездов (без оформления отчёта).
   // [MINIAPP] Кнопок «Посмотреть выезды» и «Сводка за месяц» в меню больше нет — их заменило
   // мини-приложение. Обработчики оставлены намеренно: в истории чатов остались старые сообщения
@@ -1375,50 +1465,75 @@ async function handleCallback(callback) {
     return;
   }
 
-  // Выбор выезда из списка / «Пропустить» / «Создать карточку».
+  // Выбор выезда из списка / «➕ Новый выезд» (pick_create; pick_skip остался для старых сообщений).
   if (data.startsWith("pick_")) {
     const key = data.slice(5);
+    if (key === "retry") {
+      return offerTripChoice(chatId, session);
+    }
     if (key === "skip") {
-      session.data.tripId = null;
+      // Кнопки «Пропустить» больше нет. Нажатие в старом сообщении не оставляем молча:
+      // без выезда отчёт не отметится в приложении.
+      await sendMessage(chatId, "Отчёт теперь всегда привязывается к выезду. Выберите выезд из списка или заведите новый — /start.");
+      return;
     } else if (key === "create") {
+      // Новый выезд: спрашиваем название и задачи, карточка заведётся при отправке отчёта.
       session.data.tripId = null;
-      session.data.tripCreate = true; // карточка будет создана при отправке (только заключительный)
+      session.data.tripCreate = true;
+      return askNewTripName(chatId, session);
     } else {
       const t = session.tripChoices && session.tripChoices[key];
+      if (!t) {
+        // Кнопка из старого сообщения (бот перезапускался — список в памяти пуст).
+        await sendMessage(chatId, "Этот список выездов уже неактуален — начните заново командой /start.");
+        return;
+      }
       if (t) {
+        session.data.tripCreate = false;   // выбрали существующую — новую карточку не создаём
         session.data.tripId = t.id;
         session.data.tripName = t.name || "";
-        session.data.tripTasks = t.comment || ""; // «Задачи на выезд» = поле comment
+        session.data.tripTasks = String(t.comment || "").trim(); // «Задачи на выезд» = поле comment
+        session.data.projectName = t.name || ""; // название проекта = название выезда, отдельно не спрашиваем
       }
     }
-    // Для предварительного — подтянуть и показать задачи из карточки.
-    if (session.data.reportType !== "final" && session.data.tripId) {
-      const tasks = session.data.tripTasks
-        ? `📋 Задачи по выезду «${session.data.tripName}»:\n${session.data.tripTasks}`
-        : `📋 В карточке выезда «${session.data.tripName}» задачи не указаны — впишете вручную.`;
-      await sendMessage(chatId, tasks);
+    // Задачи выбранной карточки показываем как справку — заново их вводить не нужно.
+    if (session.data.tripId && session.data.reportType !== "final") {
+      if (session.data.tripTasks) {
+        await sendMessage(chatId, `📋 Задачи по выезду «${session.data.tripName}»:\n${session.data.tripTasks}`);
+      } else {
+        // В карточке задач нет — без них отчёт бессмысленный, спрашиваем.
+        await sendMessage(chatId, `📋 В карточке выезда «${session.data.tripName}» задачи не заполнены.`);
+        return askNewTripTasks(chatId, session);
+      }
     }
     await goChecklist(chatId, session);
     return;
   }
 
   if (data === "checklist_ok") {
-    session.step = "project";
-    // Если выезд выбран из приложения — предлагаем его название кнопкой (или ввести вручную).
-    if (session.data.tripName) {
-      await sendMessage(
-        chatId,
-        "Введите наименование проекта или используйте название из карточки выезда:",
-        { inline_keyboard: [[{ text: `📋 ${session.data.tripName}`.slice(0, 60), callback_data: "use_project" }]] }
-      );
-    } else {
-      await sendMessage(chatId, "Введите наименование проекта:");
+    if (session.step === "newtrip_name" || session.step === "newtrip_tasks") {
+      await tg("answerCallbackQuery", { callback_query_id: callback.id, text: "Сначала ответьте на вопрос выше", show_alert: true }).catch(() => {});
+      return;
     }
+    // Отдельного шага «наименование проекта» больше нет: название берётся из карточки выезда,
+    // а у нового выезда его вводят в самом начале. Сразу спрашиваем дату.
+    if (!session.data.projectName) session.data.projectName = session.data.tripName || "";
+    // Страховка на случай старых кнопок из истории чата: без названия отчёт уйдёт с пустым
+    // «Проект:» — спрашиваем его, а не молчим.
+    if (!session.data.projectName) return askNewTripName(chatId, session);
+    session.step = "date";
+    await sendMessage(chatId, DATE_PROMPT, dateKeyboard);
     return;
   }
 
   // Использовать название проекта из выбранной карточки выезда.
   if (data === "use_project") {
+    // Кнопка из старых сообщений: шага «наименование проекта» больше нет. Срабатываем ТОЛЬКО
+    // если сессия действительно на нём — иначе нажатие в истории откатывало пройденные шаги.
+    if (session.step !== "project") {
+      await tg("answerCallbackQuery", { callback_query_id: callback.id, text: "Это сообщение устарело — начните заново через /start", show_alert: true }).catch(() => {});
+      return;
+    }
     session.data.projectName = session.data.tripName || "";
     session.step = "date";
     await sendMessage(chatId, `Проект: ${session.data.projectName}\n\n${DATE_PROMPT}`, dateKeyboard);
