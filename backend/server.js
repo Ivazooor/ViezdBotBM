@@ -46,6 +46,17 @@ const PDF_MAX_PHOTOS = Number(process.env.PDF_MAX_PHOTOS) || 20;
 // Токен ТОЛЬКО из .env (репозиторий публичный — не хардкодить!). Пусто → интеграция отключена.
 const BM_API_URL = (process.env.BM_API_URL || "https://xn----8sbbqciguqh9br.xn--p1ai/api/bot.php").trim();
 const BM_API_TOKEN = (process.env.BM_API_TOKEN || "").trim();
+// [MINIAPP] Мини-приложение «Приложение по выездам» — информационное окно внутри Telegram:
+// свои выезды (задачи, фото задачи, контакт заказчика) и итоги по качеству. Отчёты по-прежнему
+// оформляются здесь, в боте. Требование Telegram: только https-адрес.
+const MINIAPP_URL = (process.env.MINIAPP_URL || "https://xn----8sbbqciguqh9br.xn--p1ai/viezd/").trim();
+// Логин бота — нужен для запасной кнопки в групповом чате (там web_app-кнопки Telegram запрещает).
+const BOT_USERNAME = (process.env.BOT_USERNAME || "bmhpolabot").trim().replace(/^@/, "");
+// Адрес мини-приложения должен быть https и БЕЗ якоря: Telegram сам дописывает в адрес свой
+// #tgWebAppData (из него приложение читает подпись). Кривой адрес Telegram не принимает и отвергает
+// СООБЩЕНИЕ ЦЕЛИКОМ — тогда /start молчал бы у всех. Поэтому при плохом адресе кнопку web_app
+// не ставим вовсе: меню уходит с обычной ссылкой, бот остаётся рабочим.
+const MINIAPP_OK = /^https:\/\/\S+$/i.test(MINIAPP_URL) && !MINIAPP_URL.includes("#");
 // Кого упоминать в вопросе «выезд выполнен?» (ответственный за финальный статус).
 const STATUS_MENTION = (process.env.STATUS_MENTION || "@matiyver").trim();
 // Кого тегать отдельным сообщением при заключительном отчёте (для уведомления).
@@ -295,14 +306,35 @@ function tripLabel(t) {
 }
 
 // ===== Клавиатуры =====
-const typeKeyboard = {
-  inline_keyboard: [
-    [{ text: "🟦 Предварительный отчет", callback_data: "type_pre" }],
-    [{ text: "✅ Заключительный отчет", callback_data: "type_final" }],
-    [{ text: "👁 Посмотреть выезды", callback_data: "view_trips" }],
-    [{ text: "📊 Сводка за месяц", callback_data: "summary_menu" }],
-  ],
-};
+// [MINIAPP] Стартовое меню. Просмотр выездов и сводка за месяц переехали в мини-приложение —
+// там же контакт заказчика, фото задачи и итоги по качеству.
+// Кнопку web_app Telegram принимает ТОЛЬКО в личном чате: у групп положить её нельзя — сообщение
+// целиком не уйдёт (BUTTON_TYPE_INVALID). Личный чат = положительный chat_id, группа = отрицательный.
+function typeKeyboardFor(chatId, noWebApp) {
+  const isPrivate = Number(chatId) > 0;
+  const appBtn = (isPrivate && MINIAPP_OK && !noWebApp)
+    ? { text: "🚗 Приложение по выездам", web_app: { url: MINIAPP_URL } }
+    : { text: "🚗 Приложение по выездам", url: `https://t.me/${BOT_USERNAME}` };
+  return {
+    inline_keyboard: [
+      [{ text: "🟦 Предварительный отчет", callback_data: "type_pre" }],
+      [{ text: "✅ Заключительный отчет", callback_data: "type_final" }],
+      [appBtn],
+    ],
+  };
+}
+// Отправка стартового меню. Если Telegram по какой-то причине не принял кнопку мини-приложения
+// (BUTTON_TYPE_INVALID и т.п.), повторяем БЕЗ неё — сотрудник в любом случае получает меню
+// и может сдать отчёт. Молчащий бот здесь недопустим.
+const MENU_TEXT = "Привет! Выбери что требуется:";
+async function sendTypeMenu(chatId) {
+  try {
+    return await sendMessage(chatId, MENU_TEXT, typeKeyboardFor(chatId));
+  } catch (error) {
+    logEvent("error", "меню с кнопкой мини-приложения не ушло:", error.message);
+    return sendMessage(chatId, MENU_TEXT, typeKeyboardFor(chatId, true));
+  }
+}
 const checklistKeyboard = {
   inline_keyboard: [[{ text: "Всё проверил — продолжить", callback_data: "checklist_ok" }]],
 };
@@ -403,13 +435,13 @@ async function startReport(chatId, userId) {
   }
 
   session.step = "type";
-  await sendMessage(chatId, "Привет! Выбери что требуется:", typeKeyboard);
+  await sendTypeMenu(chatId);
 }
 
 // Меню выбора типа отчёта (после старта/регистрации).
 function showTypeMenu(chatId, session) {
   session.step = "type";
-  return sendMessage(chatId, "Привет! Выбери что требуется:", typeKeyboard);
+  return sendTypeMenu(chatId);
 }
 
 // Показ чек-листа требований (общий шаг после выбора типа и выезда).
@@ -900,6 +932,17 @@ async function handleMessage(message) {
     await startReport(chatId, userId);
     return;
   }
+  // [MINIAPP] Запасные входы: кнопок «Посмотреть выезды» и «Сводка за месяц» в меню больше нет
+  // (их заменило мини-приложение), но команды остаются — на случай, если приложение не открылось
+  // или нужна общая сводка по всем выездам месяца.
+  if (text === "/trips" || text === "/vyezdy") {
+    await showTripsForView(chatId, getSession(userId));
+    return;
+  }
+  if (text === "/summary" || text === "/svodka") {
+    await showSummaryMenu(chatId);
+    return;
+  }
   if (text === "/cancel") {
     resetSession(userId);
     await sendMessage(chatId, "Отменено. Чтобы начать заново — /start.");
@@ -1016,7 +1059,9 @@ async function handleMessage(message) {
       return sendMessage(chatId, "Выберите выезд из списка кнопкой выше (или «Пропустить»).");
 
     default:
-      return sendMessage(chatId, "Чтобы создать фотоотчёт о выезде — отправьте /start.");
+      return sendMessage(chatId,
+        "Чтобы создать фотоотчёт о выезде — отправьте /start.\n"
+        + "Список выездов — /trips, сводка за месяц — /summary.");
   }
 }
 
@@ -1298,6 +1343,9 @@ async function handleCallback(callback) {
   const session = getSession(userId);
 
   // Режим просмотра выездов (без оформления отчёта).
+  // [MINIAPP] Кнопок «Посмотреть выезды» и «Сводка за месяц» в меню больше нет — их заменило
+  // мини-приложение. Обработчики оставлены намеренно: в истории чатов остались старые сообщения
+  // с этими кнопками, и нажатие на них должно работать, а не молчать.
   if (data === "view_trips") {
     await showTripsForView(chatId, session);
     return;
@@ -1527,6 +1575,10 @@ app.listen(PORT, "0.0.0.0", () => {
   }
   if (!TARGET_CHAT_ID) logEvent("error", "⚠️  TELEGRAM_CHAT_ID (целевой чат) не задан.");
   if (ALLOWED_USER_IDS.length === 0) logEvent("error", "⚠️  ALLOWED_USER_IDS пуст — бот никого не пустит.");
+  if (!MINIAPP_OK) {
+    logEvent("error", "⚠️  MINIAPP_URL должен быть https-адресом без «#» — кнопка мини-приложения "
+      + "заменена на обычную ссылку. Сейчас: " + (MINIAPP_URL || "(пусто)"));
+  }
   console.log("Запуск Telegram-бота (long polling)…");
   poll();
 });
