@@ -1152,7 +1152,7 @@ async function requestBadReason(callback, { kind, tripId }) {
   try {
     ask = await sendMessage(
       msg.chat.id,
-      `⚠️ ${senderName(callback.from)}, укажите причину — почему выезд не качественный?\n\n` +
+      `⚠️ ${senderName(callback.from)}, укажите причину — ${kind === "board" ? "почему выезд не выполнен" : "почему выезд не качественный"}?\n\n` +
         `Ответьте (Reply) на это сообщение или просто напишите причину следующим сообщением. ` +
         `Причина попадёт в карточку выезда, карточка будет перемещена в «Брак».`
     );
@@ -1531,7 +1531,9 @@ async function handleCallback(callback) {
     // Кнопка из старых сообщений: шага «наименование проекта» больше нет. Срабатываем ТОЛЬКО
     // если сессия действительно на нём — иначе нажатие в истории откатывало пройденные шаги.
     if (session.step !== "project") {
-      await tg("answerCallbackQuery", { callback_query_id: callback.id, text: "Это сообщение устарело — начните заново через /start", show_alert: true }).catch(() => {});
+      // Обычным сообщением, а не alert'ом: ответ на старый callback Telegram отклоняет
+      // («query is too old»), и сотрудник не видел ничего — бот выглядел сломанным.
+      await sendMessage(chatId, "Это сообщение устарело — начните заново через /start.");
       return;
     }
     session.data.projectName = session.data.tripName || "";
@@ -1548,6 +1550,12 @@ async function handleCallback(callback) {
   }
 
   if (data === "skip_comment") {
+    // Кнопка из старых сообщений. Срабатывает только на своём шаге: раньше нажатие на шаге
+    // медиа обнуляло session.data.comment, и в чат уходило «Перечень задач: —».
+    if (session.step !== "comment") {
+      await sendMessage(chatId, "Это сообщение устарело — задачи уже заполнены.");
+      return;
+    }
     session.data.comment = "";
     session.step = "media";
     await sendMessage(chatId, MEDIA_PROMPT, mediaKeyboard);
