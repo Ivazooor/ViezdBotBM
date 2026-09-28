@@ -1,6 +1,10 @@
 import express from "express";
 import dotenv from "dotenv";
 import fetch from "node-fetch";
+import { fileURLToPath } from "node:url";
+import { randomBytes } from "node:crypto";
+import { ReportOutbox } from "./report-outbox.js";
+import { normalizeMessageIds, copyReportMessages } from "./report-delivery.js";
 import { buildVisitPdf } from "./pdf.js";
 
 dotenv.config();
@@ -41,11 +45,17 @@ const BRAND = {
 };
 // Максимум фото, попадающих в PDF (защита от тяжёлого файла).
 const PDF_MAX_PHOTOS = Number(process.env.PDF_MAX_PHOTOS) || 20;
+// Обычный Bot API принимает загружаемый документ до 50 МБ. Фото в рабочем чате
+// остаются полными; для PDF ограничиваем общий размер скачанных исходников.
+const PDF_INPUT_BUDGET_BYTES = 35 * 1024 * 1024;
+const PDF_UPLOAD_LIMIT_BYTES = 49 * 1024 * 1024;
 
 // Интеграция с KPI-приложением (отдел «Выезды»): выбор карточки выезда + запись результата.
 // Токен ТОЛЬКО из .env (репозиторий публичный — не хардкодить!). Пусто → интеграция отключена.
 const BM_API_URL = (process.env.BM_API_URL || "https://xn----8sbbqciguqh9br.xn--p1ai/api/bot.php").trim();
 const BM_API_TOKEN = (process.env.BM_API_TOKEN || "").trim();
+const REPORT_OUTBOX_PATH = (process.env.REPORT_OUTBOX_PATH || fileURLToPath(new URL("../data/report-outbox.json", import.meta.url))).trim();
+const reportOutbox = new ReportOutbox(REPORT_OUTBOX_PATH);
 // [MINIAPP] Мини-приложение «Приложение по выездам» — информационное окно внутри Telegram:
 // свои выезды (задачи, фото задачи, контакт заказчика) и итоги по качеству. Отчёты по-прежнему
 // оформляются здесь, в боте. Требование Telegram: только https-адрес.
@@ -131,7 +141,7 @@ function senderName(from) {
 }
 
 // ===== Вызов Telegram API (с автоповтором при 429 и сетевых сбоях) =====
-async function tg(method, params = {}, timeoutMs = 65000) {
+async function tg(method, params = {}, timeoutMs = 65000, retryNetwork = true, floodBudget = null) {
   let lastErr;
   for (let attempt = 0; attempt <= 4; attempt++) {
     const controller = new AbortController();
@@ -148,8 +158,13 @@ async function tg(method, params = {}, timeoutMs = 65000) {
       // 429 Too Many Requests — Telegram просит подождать retry_after секунд и повторить.
       const retryAfter = data.parameters && data.parameters.retry_after;
       if (response.status === 429 && retryAfter) {
+        const delayMs = (retryAfter + 1) * 1000;
+        if (floodBudget && delayMs > floodBudget.remainingMs) {
+          throw new Error(`${method}: лимит Telegram 429 превысил ожидание 60 секунд`);
+        }
+        if (floodBudget) floodBudget.remainingMs -= delayMs;
         logEvent("warn", `${method}: лимит 429, пауза ${retryAfter}s (попытка ${attempt + 1})`);
-        await sleep((retryAfter + 1) * 1000);
+        await sleep(delayMs);
         continue;
       }
       // Прочие ошибки API (400/403 и т.п.) — повторять бессмысленно.
@@ -158,6 +173,13 @@ async function tg(method, params = {}, timeoutMs = 65000) {
       lastErr = error;
       // Ошибка API (а не сети) — пробрасываем сразу.
       if (error.message && error.message.indexOf(`${method}:`) === 0) throw error;
+      // При выдаче найденного отчёта повтор после неизвестного исхода сети мог бы
+      // прислать сотруднику те же сообщения ещё раз. Обычный поток отчёта не меняем.
+      if (!retryNetwork) {
+        // Ответ Telegram не получен: сообщение могло быть доставлено.
+        error.uncertain = true;
+        throw error;
+      }
       // Сетевой сбой/таймаут — короткий backoff и повтор.
       if (attempt < 4) {
         logEvent("warn", `${method}: сеть (${error.message}), повтор ${attempt + 1}`);
@@ -198,9 +220,15 @@ function logEvent(level, ...parts) {
 // Скачать файл из Telegram по file_id (download-лимит Bot API — 20 МБ; для фото достаточно).
 async function downloadFile(fileId) {
   const file = await tg("getFile", { file_id: fileId });
-  const response = await fetch(`${FILE_API}/${file.file_path}`);
-  if (!response.ok) throw new Error(`download ${response.status}`);
-  return Buffer.from(await response.arrayBuffer());
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 45000);
+  try {
+    const response = await fetch(`${FILE_API}/${file.file_path}`, { signal: controller.signal });
+    if (!response.ok) throw new Error(`download ${response.status}`);
+    return Buffer.from(await response.arrayBuffer());
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // Отправить документ (PDF) в чат через multipart (нативные fetch/FormData/Blob Node 18+).
@@ -209,16 +237,22 @@ async function sendDocument(chatId, buffer, filename, caption) {
   form.append("chat_id", String(chatId));
   if (caption) form.append("caption", caption);
   form.append("document", new Blob([buffer], { type: "application/pdf" }), filename);
-  const response = await globalThis.fetch(`${API}/sendDocument`, { method: "POST", body: form });
-  const data = await response.json();
-  if (!data.ok) throw new Error(`sendDocument: ${data.description || response.status}`);
-  return data.result;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 120000);
+  try {
+    const response = await globalThis.fetch(`${API}/sendDocument`, { method: "POST", body: form, signal: controller.signal });
+    const data = await response.json();
+    if (!data.ok) throw new Error(`sendDocument: ${data.description || response.status}`);
+    return data.result;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // Имя PDF-файла вида «Отчет о выезде: <Проект> <Дата>.pdf».
 function pdfFilename(d) {
   const clean = (s) => String(s || "").replace(/[\\/\n\r\t]+/g, " ").trim();
-  const project = clean(d.projectName) || "проект";
+  const project = clean(d.tripName || d.projectName) || "выезд";
   const date = clean(d.visitDate);
   const name = `Отчет о выезде: ${project} ${date}`.trim().slice(0, 120);
   return `${name}.pdf`;
@@ -242,26 +276,30 @@ async function bmApi(method, payload = {}) {
     opts.headers["Content-Type"] = "application/json";
     opts.body = JSON.stringify(payload);
   }
-  // [B1] Устойчивость: сетевые сбои и 5xx повторяем (до 3 попыток с backoff).
-  // 4xx (401 токен, 404 выезд не найден, 400) — постоянные ошибки, повтор бессмыслен.
+  // Срок каждого обращения ограничен: зависший сайт не должен останавливать выдачу.
+  // Для report_jobs тело с тем же claimId повторяется после любой сетевой неопределённости.
   let lastErr;
   for (let attempt = 0; attempt <= 2; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
     let response;
     try {
-      response = await fetch(url, opts);
-    } catch (netErr) {
-      lastErr = new Error("сеть: " + netErr.message);
-      if (attempt < 2) { logEvent("warn", "bmApi", payload.op || method, "сеть, повтор " + (attempt + 1)); await sleep(1000 * (attempt + 1)); continue; }
-      throw lastErr;
+      response = await fetch(url, { ...opts, signal: controller.signal });
+      if (response.status >= 500) throw new Error("api " + response.status);
+      const data = await response.json();
+      if (!data.ok) { const e = new Error(data.error || `api ${response.status}`); if (data.code) e.code = data.code; e.permanent = response.status < 500; throw e; }
+      return data;
+    } catch (error) {
+      lastErr = error;
+      if (error.permanent) throw error;
+      // Прочие POST-операции с неоднозначным ответом уже обязаны быть идемпотентны.
+      if (attempt < 2) {
+        logEvent("warn", "bmApi", payload.op || method, "сеть/ответ, повтор " + (attempt + 1));
+        await sleep(1000 * (attempt + 1));
+      }
+    } finally {
+      clearTimeout(timer);
     }
-    if (response.status >= 500) {
-      lastErr = new Error("api " + response.status);
-      if (attempt < 2) { logEvent("warn", "bmApi", payload.op || method, "5xx, повтор " + (attempt + 1)); await sleep(1000 * (attempt + 1)); continue; }
-      throw lastErr;
-    }
-    const data = await response.json().catch(() => ({}));
-    if (!data.ok) { const e = new Error(data.error || `api ${response.status}`); if (data.code) e.code = data.code; throw e; }
-    return data;
   }
   throw lastErr || new Error("bmApi: не удалось");
 }
@@ -272,6 +310,14 @@ async function bmGetTrips() {
   return Array.isArray(data.trips) ? data.trips : [];
 }
 
+async function assertReportApiCompatible() {
+  const caps = await bmApi("GET", { op: "capabilities" });
+  if (caps.visitReportsVersion !== 2 || caps.reportJobsProtocol !== "claim-v1" || caps.attachReport !== true
+      || String(caps.sourceChatId || "") !== TARGET_CHAT_ID) {
+    throw new Error("несовместимая версия API отчётов");
+  }
+}
+
 // Профиль сотрудника (ФИО) по Telegram ID.
 async function bmGetProfile(userId) {
   const data = await bmApi("GET", { op: "profile", uid: String(userId) });
@@ -279,6 +325,190 @@ async function bmGetProfile(userId) {
 }
 async function bmSaveProfile(userId, fio) {
   return bmApi("POST", { op: "save_profile", uid: String(userId), fio });
+}
+
+// Выдача найденного в мини-приложении отчёта в личный чат сотрудника.
+// До каждого внешнего Telegram-вызова состояние пишется на диск. После сбоя
+// процесса незавершённую отправку НЕ повторяем: Telegram не поддерживает
+// идемпотентный ключ, поэтому её исход может быть неизвестен.
+const REPORT_JOBS_POLL_MS = 5000;
+let reportJobsPolling = false;
+
+async function flushReportAck(id, ack) {
+  try {
+    const { attempts: _attempts, retryAt: _retryAt, ...payload } = ack;
+    await bmApi("POST", { op: "report_job_done", id, ...payload });
+    reportOutbox.removeAck(id);
+  } catch (error) {
+    reportOutbox.deferAck(id);
+    logEvent("error", `report_job_done ${id}: ${error.message}`);
+  }
+}
+
+async function deliverReportJob(id, entry) {
+  const { job, claimId } = entry;
+  if (entry.started) {
+    // После рестарта неизвестно, успел ли Telegram отправить что-либо.
+    const ack = { claimId, status: "unknown", error: "Бот перезапустился во время выдачи отчёта; проверьте личный чат" };
+    reportOutbox.finishDelivery(id, ack);
+    await flushReportAck(id, ack);
+    return;
+  }
+
+  let recipient = "";
+  let introSent = false;
+  let copiedCount = 0;
+  let totalCount = 0;
+  let status = "done";
+  let reason = "";
+  const floodBudget = { remainingMs: 60000 };
+  try {
+    recipient = String(job.tgId || "");
+    if (!/^\d{5,20}$/.test(recipient)) throw new Error("некорректный Telegram ID");
+    if (String(job.chatId || "") !== TARGET_CHAT_ID) throw new Error("неверный чат отчёта");
+    if (job.type !== "prelim" && job.type !== "final") throw new Error("неверный тип отчёта");
+    const ids = normalizeMessageIds(job.messageIds);
+    totalCount = ids.length;
+
+    reportOutbox.markStarted(id); // после этой точки повторное копирование после рестарта запрещено
+    const intro = `${reportTypeLabel(job.type)} фотоотчёт\n`
+      + `Выезд: ${String(job.tripName || "Выезд").slice(0, 200)}\n`
+      + (job.projectName ? `Проект: ${String(job.projectName).slice(0, 200)}\n` : "")
+      + `Дата выезда: ${String(job.date || "").slice(0, 40)}\n`
+      + "Фото, видео и PDF (если он был сформирован) — ниже.";
+    await tg("sendMessage", { chat_id: recipient, text: intro }, 65000, false, floodBudget);
+    introSent = true;
+    ({ copiedCount, totalCount } = await copyReportMessages(ids, (chunk) => tg("copyMessages", {
+      chat_id: recipient,
+      from_chat_id: TARGET_CHAT_ID,
+      message_ids: chunk,
+    }, 65000, false, floodBudget), (count) => { copiedCount = count; }));
+    if (copiedCount !== totalCount) {
+      status = "failed";
+      reason = `Telegram скопировал ${copiedCount} из ${totalCount} сообщений`;
+    }
+  } catch (error) {
+    status = error.uncertain ? "unknown" : "failed";
+    reason = String(error && error.message || error).slice(0, 240);
+  }
+
+  if (status === "done") logEvent("info", `report_job ${id}: доставлено ${copiedCount} сообщений`);
+  else logEvent("error", `report_job ${id}: ${status}: ${reason}`);
+  if (introSent && status !== "done") {
+    const warning = status === "unknown"
+      ? `⚠️ Результат отправки части отчёта неизвестен. Достоверно скопировано: ${copiedCount} из ${totalCount}. Проверьте сообщения выше перед новым запросом.`
+      : `⚠️ Отчёт доставлен не полностью: ${copiedCount} из ${totalCount} сообщений. Проверьте файлы выше.`;
+    await tg("sendMessage", { chat_id: recipient, text: warning }, 65000, false, floodBudget).catch(() => {});
+  }
+  const ack = { claimId, status, ...(reason ? { error: reason } : {}) };
+  reportOutbox.finishDelivery(id, ack); // ACK переживает перезапуск и сетевой сбой KPI
+  await flushReportAck(id, ack);
+}
+
+// В рабочий чат файлы уже попали. Сохраняем запрос на диск до обращения
+// к KPI; при неудаче основной записи индекс существующей карточки можно
+// восстановить отдельным attach_report без повторной отправки Telegram-файлов.
+async function postReportWithOutbox(primary, fallback = null) {
+  const id = String(primary.report && primary.report.id || "");
+  if (!id) throw new Error("Нет ID отчёта для сохранения в KPI");
+  const retryPayload = fallback || primary;
+  let durable = false;
+  try {
+    reportOutbox.queueReport(id, retryPayload);
+    durable = true;
+  } catch (error) {
+    logEvent("error", `report_index ${id}: не удалось записать дисковую очередь: ${error.message}`);
+  }
+  try {
+    await assertReportApiCompatible();
+  } catch (error) {
+    if (durable) reportOutbox.deferReport(id);
+    error.indexQueued = durable;
+    throw error;
+  }
+  try {
+    const result = await bmApi("POST", primary);
+    if (durable) {
+      try { reportOutbox.removeReport(id); }
+      catch (cleanupError) { logEvent("error", `report_index ${id}: очистка очереди: ${cleanupError.message}`); }
+    }
+    return result;
+  } catch (error) {
+    if (fallback) {
+      try {
+        await bmApi("POST", fallback);
+        error.indexAttached = true;
+        if (durable) {
+          try { reportOutbox.removeReport(id); }
+          catch (cleanupError) { logEvent("error", `report_index ${id}: очистка очереди: ${cleanupError.message}`); }
+        }
+      } catch (attachError) {
+        logEvent("error", `report_index ${id}: attach_report: ${attachError.message}`);
+        if (durable) reportOutbox.deferReport(id);
+      }
+    } else if (durable) {
+      reportOutbox.deferReport(id);
+    }
+    error.indexQueued = durable && !error.indexAttached;
+    if (!durable && !error.indexAttached) error.message += " (автоматический повтор недоступен: ошибка дисковой очереди)";
+    throw error;
+  }
+}
+
+async function flushReportIndex(maxItems = 3) {
+  if (!bmEnabled()) return;
+  const due = reportOutbox.reportEntries()
+    .filter(([, entry]) => !entry.staged && (entry.retryAt || 0) <= Date.now())
+    .slice(0, maxItems);
+  if (due.length) {
+    try { await assertReportApiCompatible(); }
+    catch (error) {
+      for (const [id] of due) reportOutbox.deferReport(id);
+      logEvent("error", "report_index: несовместимый или недоступный KPI API:", error.message);
+      return;
+    }
+  }
+  for (const [id, entry] of due) {
+    try {
+      await bmApi("POST", entry.payload);
+      reportOutbox.removeReport(id);
+      logEvent("info", `report_index ${id}: восстановлен в KPI`);
+    } catch (error) {
+      reportOutbox.deferReport(id);
+      logEvent("error", `report_index ${id}: ${error.message}`);
+    }
+  }
+}
+
+async function pollReportJobs() {
+  if (reportJobsPolling || !bmEnabled() || !TARGET_CHAT_ID) return;
+  reportJobsPolling = true;
+  try {
+    await flushReportIndex();
+    for (const [id, ack] of reportOutbox.ackEntries()
+      .filter(([, entry]) => (entry.retryAt || 0) <= Date.now()).slice(0, 3)) {
+      await flushReportAck(id, ack);
+    }
+    for (const [id, entry] of reportOutbox.deliveryEntries()) await deliverReportJob(id, entry);
+    // Пока локальная доставка не завершена, новые задания не захватываем.
+    if (reportOutbox.deliveryEntries().length) return;
+
+    let claimId = reportOutbox.pendingClaimId();
+    if (!claimId) {
+      claimId = randomBytes(12).toString("hex");
+      reportOutbox.setClaim(claimId);
+    }
+    const data = await bmApi("POST", { op: "report_jobs", claimId });
+    if (!Array.isArray(data.jobs)) throw new Error("report_jobs: отсутствует массив jobs");
+    // Ответ сохраняется вместе с заданиями до удаления claimId. Если ответ
+    // потерялся, следующий poll повторит тот же claimId и получит ту же пачку.
+    reportOutbox.saveClaimedJobs(claimId, data.jobs);
+    for (const [id, entry] of reportOutbox.deliveryEntries()) await deliverReportJob(id, entry);
+  } catch (error) {
+    logEvent("error", "report_jobs:", error.message);
+  } finally {
+    reportJobsPolling = false;
+  }
 }
 
 // Дата выезда «YYYY-MM-DD» → «ДД / месяц словом» (без года); иначе как есть.
@@ -492,14 +722,18 @@ function goAfterResponsible(chatId, session) {
 }
 
 // Вторым действием после выбора типа — выбор выезда из отдела «Выезды».
-async function offerTripChoice(chatId, session) {
-  // Интеграция не настроена (нет токена) — карточку завести негде, но название и задачи
-  // всё равно нужны: без них отчёт уходит в чат и в PDF заказчику с пустым «Проект:».
-  if (!bmEnabled()) return askNewTripName(chatId, session);
+async function offerTripChoice(chatId, session, page = 0, useCached = false) {
+  // Интеграция должна быть доступна до оформления отчёта.
+  if (!bmEnabled()) {
+    session.step = "type";
+    await sendMessage(chatId, "⚠️ Связь с программой выездов не настроена. Отчёт сейчас нельзя привязать к карточке и найти через поиск. Попробуйте позже.");
+    return;
+  }
 
   let trips = [];
+  const fromCache = useCached && Array.isArray(session.tripList);
   try {
-    trips = await bmGetTrips();
+    trips = fromCache ? session.tripList : await bmGetTrips();
   } catch (error) {
     logEvent("error", "bmGetTrips:", error.message);
     // Не уводим сразу в «новый выезд»: при короткой сетевой икоте так появился бы дубль карточки
@@ -514,21 +748,31 @@ async function offerTripChoice(chatId, session) {
     return;
   }
 
+  session.tripList = trips.filter((t) => t && t.id);
+  if (!fromCache) session.tripChoiceToken = randomBytes(3).toString("hex");
   session.tripChoices = {};
-  const rows = [];
-  trips.slice(0, 30).forEach((t) => {
-    if (!t || !t.id) return;
-    session.tripChoices[t.id] = t;
-    rows.push([{ text: tripLabel(t), callback_data: "pick_" + t.id }]);
+  session.tripList.forEach((t) => {
+    session.tripChoices[String(t.id)] = t; // старые кнопки из уже отправленных сообщений
   });
-  // Выезда нет в списке — заводим новый прямо здесь: название и задачи спросим сразу,
-  // карточка появится в приложении при отправке отчёта. Кнопки «Пропустить» больше нет:
-  // отчёт без привязки к выезду не отмечался в карточке и терялся для приложения.
+  const pageSize = 15;
+  const pageCount = Math.max(1, Math.ceil(session.tripList.length / pageSize));
+  const currentPage = Math.max(0, Math.min(Number(page) || 0, pageCount - 1));
+  const rows = [];
+  for (let i = currentPage * pageSize; i < Math.min((currentPage + 1) * pageSize, session.tripList.length); i++) {
+    // CRM ID может быть длиннее лимита Telegram callback_data (64 байта).
+    rows.push([{ text: tripLabel(session.tripList[i]), callback_data: `pick_i${session.tripChoiceToken}_${i}` }]);
+  }
+  if (pageCount > 1) {
+    const navigation = [];
+    if (currentPage > 0) navigation.push({ text: "← Назад", callback_data: `pick_page_${session.tripChoiceToken}_${currentPage - 1}` });
+    if (currentPage + 1 < pageCount) navigation.push({ text: "Далее →", callback_data: `pick_page_${session.tripChoiceToken}_${currentPage + 1}` });
+    rows.push(navigation);
+  }
   rows.push([{ text: "➕ Новый выезд — нет в списке", callback_data: "pick_create" }]);
 
   session.step = "picktrip";
-  const head = rows.length > 1
-    ? "Выберите выезд из отдела «Выезды» или заведите новый:"
+  const head = session.tripList.length
+    ? `Выберите выезд из отдела «Выезды» (${currentPage + 1}/${pageCount}) или заведите новый:`
     : "Незавершённых выездов в приложении нет — заведите новый.";
   await sendMessage(chatId, head, { inline_keyboard: rows });
 }
@@ -691,7 +935,8 @@ function buildSummary(session) {
   return (
     `Проверьте отчёт перед отправкой:\n\n` +
     `Тип: ${reportTypeLabel(d.reportType)}\n` +
-    `Проект: ${d.projectName}\n` +
+    `Выезд: ${d.tripName || d.projectName}\n` +
+    (d.linkedProjectName ? `Проект: ${d.linkedProjectName}\n` : "") +
     `Дата выезда: ${d.visitDate}\n` +
     `Ответственное лицо: ${d.responsible}\n` +
     detailsLines(d) +
@@ -710,13 +955,23 @@ async function submitReport(chatId, userId, from) {
     await sendMessage(chatId, "Вы ещё не прислали ни одного фото или видео. Добавьте файлы.", mediaKeyboard);
     return;
   }
+  if (!bmEnabled()) {
+    await sendMessage(chatId, "⚠️ Связь с программой выездов не настроена. Отчёт сейчас нельзя сохранить для поиска. Данные в диалоге остались; попробуйте позже.", confirmKeyboard);
+    return;
+  }
+  if (!session.data.tripId && !session.data.tripCreate) {
+    await sendMessage(chatId, "Сначала выберите существующий выезд или создайте новый, чтобы отчёт появился в поиске.");
+    await offerTripChoice(chatId, session);
+    return;
+  }
   session.submitting = true;
 
   const d = session.data;
   const total = session.media.length;
   const header =
     `${d.reportType === "final" ? "✅" : "🟦"} ${reportTypeLabel(d.reportType)} фотоотчёт\n\n` +
-    `Проект: ${d.projectName}\n` +
+    `Выезд: ${d.tripName || d.projectName}\n` +
+    (d.linkedProjectName ? `Проект: ${d.linkedProjectName}\n` : "") +
     `Дата выезда: ${d.visitDate}\n` +
     `Ответственное лицо: ${d.responsible}\n` +
     detailsLines(d) +
@@ -724,8 +979,13 @@ async function submitReport(chatId, userId, from) {
     `Отправил: ${senderName(from)}`;
 
   // Заголовок в рабочий чат. Если упало — бот не в группе / нет прав: сообщаем и даём повторить.
+  let headerMessageId;
   try {
-    await sendMessage(TARGET_CHAT_ID, header);
+    const headerMessage = await sendMessage(TARGET_CHAT_ID, header);
+    headerMessageId = Number(headerMessage && headerMessage.message_id);
+    if (!Number.isSafeInteger(headerMessageId) || headerMessageId <= 0) {
+      throw new Error("Telegram не вернул ID заголовка отчёта");
+    }
   } catch (error) {
     logEvent("error", "target header error:", error.message);
     session.submitting = false;
@@ -738,7 +998,9 @@ async function submitReport(chatId, userId, from) {
     return;
   }
 
-  await sendMessage(chatId, "Отправляю файлы…");
+  await sendMessage(chatId, "Отправляю файлы…").catch((error) => {
+    logEvent("warn", "private progress message:", error.message);
+  });
 
   // Каждое медиа копируем по file_id (без перезагрузки — поэтому размер не ограничен).
   // Пауза между файлами + автоповтор 429 в tg() — чтобы не терять файлы из-за лимита Telegram.
@@ -746,14 +1008,20 @@ async function submitReport(chatId, userId, from) {
   logEvent("info", `Пересылка ${total0} файлов в рабочий чат (отправитель: ${senderName(from)})`);
   let sent = 0;
   let failed = 0;
+  const mediaMessageIds = [];
   for (let i = 0; i < session.media.length; i++) {
     const item = session.media[i];
     try {
-      await tg("copyMessage", {
+      const copied = await tg("copyMessage", {
         chat_id: TARGET_CHAT_ID,
         from_chat_id: item.chatId,
         message_id: item.messageId,
       });
+      const copiedId = Number(copied && copied.message_id);
+      if (!Number.isSafeInteger(copiedId) || copiedId <= 0) {
+        throw new Error("Telegram не вернул ID скопированного файла");
+      }
+      mediaMessageIds.push(copiedId);
       sent += 1;
     } catch (error) {
       failed += 1;
@@ -764,34 +1032,76 @@ async function submitReport(chatId, userId, from) {
   }
   logEvent("info", `Переслано ${sent}/${total0}, ошибок ${failed}`);
 
+  if (sent === 0) {
+    session.submitting = false;
+    await sendMessage(chatId,
+      "❌ Ни один файл не дошёл до рабочего чата. Данные отчёта сохранены — нажмите «Подтвердить и отправить» ещё раз.",
+      confirmKeyboard
+    );
+    return;
+  }
+
+  const report = {
+    id: "m" + headerMessageId,
+    type: d.reportType === "final" ? "final" : "prelim",
+    chatId: TARGET_CHAT_ID,
+    headerMessageId,
+    mediaMessageIds,
+    pdfMessageId: null,
+    visitDate: String(d.visitDate || ""),
+    projectName: String(d.linkedProjectName || ""),
+    sentAt: new Date().toISOString(),
+  };
+
+  // PDF может строиться долго. Уже скопированные в рабочий чат медиа фиксируем
+  // до его создания; при перезапуске отчёт восстановится хотя бы без PDF.
+  let stagedPayload = null;
+  if (d.reportType === "final") {
+    stagedPayload = d.tripCreate ? {
+      op: "create", kind: "final", name: d.tripName || d.projectName,
+      date: d.visitDate, comment: d.tripTasks || "", workDone: d.workDone,
+      workNotDone: d.workNotDone, recommendations: d.recommendations,
+      by: senderName(from), report,
+    } : { op: "attach_report", tripId: d.tripId, report };
+    try {
+      reportOutbox.queueReport(report.id, stagedPayload, true);
+    } catch (error) {
+      logEvent("error", `report_index ${report.id}: не удалось подготовить дисковую очередь: ${error.message}`);
+    }
+  }
+
   // Предварительный отчёт: пометить карточку выезда в приложении (если выезд выбран из списка).
   // Бот отмечает trip.checks.prelim → в KPI-приложении видно «Предварительный отчёт ✓».
   // Новый выезд в предварительном отчёте: сначала заводим карточку, потом ставим отметку.
   if (d.reportType !== "final" && bmEnabled() && !d.tripId && d.tripCreate) {
     try {
-      const created = await bmApi("POST", {
+      const created = await postReportWithOutbox({
         op: "create",
         kind: "prelim",              // карточка заводится по ПРЕДВАРИТЕЛЬНОМУ отчёту
-        name: d.projectName || d.tripName,
+        name: d.tripName || d.projectName,
         date: d.visitDate,
         comment: d.tripTasks || d.comment || "",
         by: senderName(from),
+        report,
       });
       if (created && created.id) {
         d.tripId = created.id;
-        await sendMessage(chatId, `✅ В приложении создана карточка выезда «${d.projectName || d.tripName}» с задачами.`).catch(() => {});
+        await sendMessage(chatId, `✅ В приложении создана карточка выезда «${d.tripName || d.projectName}» с задачами.`).catch(() => {});
       }
     } catch (error) {
       logEvent("error", "bm create (pre):", error.message);
       await sendMessage(chatId,
-        "⚠️ Отчёт отправлен в чат, но карточку выезда в приложении создать не удалось:\n" + error.message +
-        "\n\nСообщите руководителю — карточку можно завести вручную."
+        "⚠️ Отчёт отправлен в чат, но карточка выезда пока не создана: " + error.message +
+        (error.indexQueued
+          ? "\n\nБот сохранил запрос на повтор. Не создавайте карточку вручную, чтобы не получить дубль."
+          : "\n\nСообщите руководителю: автоматический повтор недоступен.")
       ).catch(() => {});
     }
   }
-  if (d.reportType !== "final" && bmEnabled() && d.tripId) {
+  if (d.reportType !== "final" && bmEnabled() && d.tripId && !d.tripCreate) {
     try {
-      await bmApi("POST", { op: "preliminary", tripId: d.tripId, tasks: d.tripTasks || d.comment || "", by: senderName(from) });
+      const prelim = { op: "preliminary", tripId: d.tripId, tasks: d.tripTasks || d.comment || "", by: senderName(from), report };
+      await postReportWithOutbox(prelim, { op: "attach_report", tripId: d.tripId, report });
       logEvent("info", "Отметка предварительного отчёта поставлена, tripId=" + d.tripId);
       await sendMessage(chatId,
         `✅ Бот отметил в карточке выезда${d.tripName ? " «" + d.tripName + "»" : ""}: предварительный отчёт получен.`
@@ -799,8 +1109,12 @@ async function submitReport(chatId, userId, from) {
     } catch (error) {
       logEvent("error", "bm preliminary mark:", error.message);
       await sendMessage(chatId,
-        "⚠️ Предварительный отчёт отправлен в чат, но отметку в приложении поставить не удалось:\n" +
-        error.message + "\n\nСообщите руководителю — отметку можно поставить вручную в карточке выезда."
+        "⚠️ Предварительный отчёт отправлен в чат, но отметку в карточке поставить не удалось: " + error.message +
+        (error.indexAttached
+          ? "\n\nФайлы уже доступны через поиск. Проверьте отметку отчёта и задачи в карточке выезда."
+          : error.indexQueued
+            ? "\n\nБот повторит сохранение файлов для поиска. Отметку нужно проверить в карточке выезда."
+            : "\n\nСообщите руководителю: автоматический повтор недоступен.")
       ).catch(() => {});
     }
   } else if (d.reportType !== "final" && bmEnabled() && !d.tripId && !d.tripCreate) {
@@ -815,41 +1129,71 @@ async function submitReport(chatId, userId, from) {
   let pdfNote = "";
   if (d.reportType === "final") {
     try {
-      await sendMessage(chatId, "Формирую фирменный PDF-отчёт для заказчика…");
+      await sendMessage(chatId, "Формирую фирменный PDF-отчёт для заказчика…").catch((error) => {
+        logEvent("warn", "private PDF progress message:", error.message);
+      });
       const photoIds = session.media
         .filter((m) => m.kind === "photo" && m.fileId)
         .slice(0, PDF_MAX_PHOTOS)
         .map((m) => m.fileId);
       const photos = [];
+      let photoBytes = 0;
       for (const fileId of photoIds) {
         try {
-          photos.push(await downloadFile(fileId));
+          const photo = await downloadFile(fileId);
+          if (photoBytes + photo.length > PDF_INPUT_BUDGET_BYTES) {
+            logEvent("warn", "PDF photo skipped: input size budget exceeded");
+            continue;
+          }
+          photos.push(photo);
+          photoBytes += photo.length;
         } catch (error) {
           logEvent("error", "photo download error:", error.message);
         }
       }
-      const pdf = await buildVisitPdf(
-        {
-          projectName: d.projectName,
-          visitDate: d.visitDate,
-          responsible: d.responsible,
-          workDone: d.workDone,
-          workNotDone: d.workNotDone,
-          recommendations: d.recommendations,
-        },
-        photos,
-        { brand: BRAND }
-      );
+      const pdfData = {
+        tripName: d.tripName || d.projectName,
+        projectName: d.linkedProjectName || "",
+        visitDate: d.visitDate,
+        responsible: d.responsible,
+        workDone: d.workDone,
+        workNotDone: d.workNotDone,
+        recommendations: d.recommendations,
+      };
+      let pdfPhotos = photos;
+      let pdf;
+      do {
+        pdf = await buildVisitPdf(pdfData, pdfPhotos, { brand: BRAND });
+        if (pdf.length <= PDF_UPLOAD_LIMIT_BYTES) break;
+        if (!pdfPhotos.length) throw new Error("PDF превышает лимит загрузки Telegram 50 МБ");
+        logEvent("warn", `PDF ${pdf.length} bytes exceeds Telegram limit, reducing photo count`);
+        pdfPhotos = pdfPhotos.slice(0, Math.floor(pdfPhotos.length / 2));
+      } while (true);
       const filename = pdfFilename(d);
       const caption = "Направляю Вам файл с отчетом по работам";
       // В рабочий чат (после отчёта) и сотруднику в личку.
-      await sendDocument(TARGET_CHAT_ID, pdf, filename, caption);
-      await sendDocument(chatId, pdf, filename, caption);
-      pdfNote = `\n📄 PDF-отчёт сформирован (фото в нём: ${photos.length}) и отправлен в чат и вам в личку.`;
+      const pdfMessage = await sendDocument(TARGET_CHAT_ID, pdf, filename, caption);
+      const pdfId = Number(pdfMessage && pdfMessage.message_id);
+      if (Number.isSafeInteger(pdfId) && pdfId > 0) {
+        report.pdfMessageId = pdfId;
+        // Личная отправка PDF может длиться долго. Фиксируем ID файла из рабочего
+        // чата сразу, чтобы рестарт не восстановил только фото и видео.
+        try { reportOutbox.queueReport(report.id, stagedPayload, true); }
+        catch (error) { logEvent("error", `report_index ${report.id}: не удалось сохранить PDF ID: ${error.message}`); }
+      }
+      try {
+        await sendDocument(chatId, pdf, filename, caption);
+        pdfNote = `\n📄 PDF-отчёт сформирован (фото в нём: ${pdfPhotos.length}) и отправлен в чат и вам в личку.`;
+      } catch (error) {
+        logEvent("error", "pdf private send error:", error.message);
+        pdfNote = "\n⚠️ PDF-отчёт отправлен в рабочий чат, но в личку отправить его не удалось.";
+      }
     } catch (error) {
       logEvent("error", "pdf error:", error.message);
       pdfNote = "\n⚠️ PDF-отчёт сформировать не удалось — текст и файлы в чат отправлены.";
     }
+
+    report.sentAt = new Date().toISOString();
 
     // Запись результата в карточку выезда KPI-приложения (если интеграция включена).
     let kpiTripId = d.tripId || null;
@@ -857,32 +1201,35 @@ async function submitReport(chatId, userId, from) {
       try {
         if (d.tripCreate) {
           // Запасная кнопка «Создать карточку» — заводим выезд из данных бота.
-          const created = await bmApi("POST", {
+          const created = await postReportWithOutbox({
             op: "create",
             kind: "final",
-            name: d.projectName,
+            name: d.tripName || d.projectName,
             date: d.visitDate,
             comment: d.tripTasks || "",
             workDone: d.workDone,
             workNotDone: d.workNotDone,
             recommendations: d.recommendations,
             by: senderName(from),
+            report,
           });
           kpiTripId = created.id || null;
           // Новая карточка → есть только заключительный отчёт; предупреждаем, иначе «качественный» будет заблокирован.
           await sendMessage(chatId,
-            `✅ Создана карточка выезда «${d.projectName}» с отметкой «заключительный отчёт получен».\n\n` +
+            `✅ Создана карточка выезда «${d.tripName || d.projectName}» с отметкой «заключительный отчёт получен».\n\n` +
             "⚠️ В этой карточке нет предварительного отчёта — «качественный» откроется только после того, как по этому же выезду поступит и предварительный отчёт."
           ).catch(() => {});
         } else if (kpiTripId) {
-          await bmApi("POST", {
+          const finalReport = {
             op: "final_report",
             tripId: kpiTripId,
             workDone: d.workDone,
             workNotDone: d.workNotDone,
             recommendations: d.recommendations,
             by: senderName(from),
-          });
+            report,
+          };
+          await postReportWithOutbox(finalReport, { op: "attach_report", tripId: kpiTripId, report });
           await sendMessage(chatId,
             `✅ Бот отметил в карточке выезда${d.tripName ? " «" + d.tripName + "»" : ""}: заключительный отчёт получен.`
           ).catch(() => {});
@@ -897,8 +1244,12 @@ async function submitReport(chatId, userId, from) {
         logEvent("error", "bm kpi-запись:", error.message);
         // [B1] Не молчим: отчёт ушёл в чат, но в карточку выезда (приложение) не записался.
         await sendMessage(chatId,
-          "⚠️ Отчёт отправлен в рабочий чат, но сохранить его в приложении (карточка выезда) не удалось:\n" +
-          error.message + "\n\nДанные не потеряны — сообщите руководителю, выезд можно заполнить вручную."
+          "⚠️ Отчёт отправлен в рабочий чат, но запись в карточке выезда не завершена: " + error.message +
+          (error.indexAttached
+            ? "\n\nФайлы уже доступны через поиск. Проверьте отметку отчёта и тексты работ в карточке выезда."
+            : error.indexQueued
+              ? "\n\nБот сохранил запрос на повтор. Не создавайте карточку вручную, чтобы не получить дубль."
+              : "\n\nСообщите руководителю: автоматический повтор недоступен.")
         ).catch(() => {});
       }
     }
@@ -917,7 +1268,8 @@ async function submitReport(chatId, userId, from) {
       await sendMessage(
         TARGET_CHAT_ID,
         `🔎 Оценка качества выезда\n\n` +
-          `Проект: ${d.projectName}\n` +
+          `Выезд: ${d.tripName || d.projectName}\n` +
+          (d.linkedProjectName ? `Проект: ${d.linkedProjectName}\n` : "") +
           `Дата выезда: ${d.visitDate}\n` +
           `Выездник: ${d.responsible}`,
         qk
@@ -933,7 +1285,7 @@ async function submitReport(chatId, userId, from) {
         .join(" ");
       await tg("sendMessage", {
         chat_id: TARGET_CHAT_ID,
-        text: `🔔 ${mentions} — поступил заключительный отчёт по выезду «${htmlEscape(d.projectName)}». Просьба проверить.`,
+        text: `🔔 ${mentions} — поступил заключительный отчёт по выезду «${htmlEscape(d.tripName || d.projectName)}». Просьба проверить.`,
         parse_mode: "HTML",
       });
     } catch (error) {
@@ -1063,7 +1415,8 @@ async function handleMessage(message) {
       if (!name) return sendMessage(chatId, "Напишите название выезда текстом — например: ЖК «Прайм Парк», макет 1:500");
       if (name.length > 120) return sendMessage(chatId, "Слишком длинное название — уложитесь в 120 знаков.");
       session.data.tripName = name;
-      session.data.projectName = name;      // проект = название выезда, отдельно не спрашиваем
+      session.data.projectName = name;      // подпись PDF, если отдельный проект не привязан
+      session.data.linkedProjectName = "";
       return askNewTripTasks(chatId, session);
     }
 
@@ -1468,8 +1821,18 @@ async function handleCallback(callback) {
   // Выбор выезда из списка / «➕ Новый выезд» (pick_create; pick_skip остался для старых сообщений).
   if (data.startsWith("pick_")) {
     const key = data.slice(5);
-    if (key === "retry") {
-      return offerTripChoice(chatId, session);
+    if (session.step !== "picktrip") {
+      await sendMessage(chatId, "Список выездов устарел. Начните оформление заново через /start.");
+      return;
+    }
+    if (key === "retry") return offerTripChoice(chatId, session);
+    const pageMatch = /^page_([a-f0-9]{6})_(\d{1,4})$/.exec(key);
+    if (pageMatch) {
+      if (pageMatch[1] !== session.tripChoiceToken) {
+        await sendMessage(chatId, "Список выездов обновился. Используйте последнее сообщение со списком.");
+        return;
+      }
+      return offerTripChoice(chatId, session, Number(pageMatch[2]), true);
     }
     if (key === "skip") {
       // Кнопки «Пропустить» больше нет. Нажатие в старом сообщении не оставляем молча:
@@ -1482,7 +1845,14 @@ async function handleCallback(callback) {
       session.data.tripCreate = true;
       return askNewTripName(chatId, session);
     } else {
-      const t = session.tripChoices && session.tripChoices[key];
+      const indexMatch = /^i([a-f0-9]{6})_(\d+)$/.exec(key);
+      if (indexMatch && indexMatch[1] !== session.tripChoiceToken) {
+        await sendMessage(chatId, "Список выездов обновился. Используйте последнее сообщение со списком.");
+        return;
+      }
+      const t = indexMatch
+        ? session.tripList && session.tripList[Number(indexMatch[2])]
+        : session.tripChoices && session.tripChoices[key];
       if (!t) {
         // Кнопка из старого сообщения (бот перезапускался — список в памяти пуст).
         await sendMessage(chatId, "Этот список выездов уже неактуален — начните заново командой /start.");
@@ -1493,7 +1863,8 @@ async function handleCallback(callback) {
         session.data.tripId = t.id;
         session.data.tripName = t.name || "";
         session.data.tripTasks = String(t.comment || "").trim(); // «Задачи на выезд» = поле comment
-        session.data.projectName = t.name || ""; // название проекта = название выезда, отдельно не спрашиваем
+        session.data.linkedProjectName = String(t.projectName || "").trim();
+        session.data.projectName = session.data.linkedProjectName || t.name || "";
       }
     }
     // Задачи выбранной карточки показываем как справку — заново их вводить не нужно.
@@ -1537,6 +1908,7 @@ async function handleCallback(callback) {
       return;
     }
     session.data.projectName = session.data.tripName || "";
+    session.data.linkedProjectName = "";
     session.step = "date";
     await sendMessage(chatId, `Проект: ${session.data.projectName}\n\n${DATE_PROMPT}`, dateKeyboard);
     return;
@@ -1690,18 +2062,26 @@ app.get("*", (_req, res) => {
   res.type("html").send("<h1>Бот выездных фотоотчётов работает</h1><p>Откройте бота в Telegram и отправьте /start.</p>");
 });
 
-app.listen(PORT, "0.0.0.0", () => {
+app.listen(PORT, "0.0.0.0", async () => {
   console.log(`HTTP server on port ${PORT}`);
-  if (!TELEGRAM_BOT_TOKEN) {
-    logEvent("error", "⚠️  TELEGRAM_BOT_TOKEN не задан — бот не запустится.");
-    return;
+  if (!TELEGRAM_BOT_TOKEN || !TARGET_CHAT_ID || !BM_API_TOKEN) {
+    logEvent("error", "Telegram/KPI интеграция не настроена; приём отчётов остановлен");
+    process.exit(1);
   }
-  if (!TARGET_CHAT_ID) logEvent("error", "⚠️  TELEGRAM_CHAT_ID (целевой чат) не задан.");
   if (ALLOWED_USER_IDS.length === 0) logEvent("error", "⚠️  ALLOWED_USER_IDS пуст — бот никого не пустит.");
   if (!MINIAPP_OK) {
     logEvent("error", "⚠️  MINIAPP_URL должен быть https-адресом без «#» — кнопка мини-приложения "
       + "заменена на обычную ссылку. Сейчас: " + (MINIAPP_URL || "(пусто)"));
   }
+  try {
+    await assertReportApiCompatible();
+  } catch (error) {
+    logEvent("error", "KPI API не поддерживает надёжный индекс отчётов:", error.message);
+    process.exit(1);
+  }
   console.log("Запуск Telegram-бота (long polling)…");
   poll();
+  // Отдельный короткий цикл для запросов из мини-приложения; не ждёт long polling getUpdates.
+  pollReportJobs();
+  setInterval(pollReportJobs, REPORT_JOBS_POLL_MS);
 });

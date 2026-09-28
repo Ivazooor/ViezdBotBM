@@ -46,7 +46,7 @@ const WORDMARK_RATIO = 4119 / 680;
 
 /**
  * Собрать PDF-отчёт.
- * @param {object} data { projectName, visitDate, responsible, workDone, workNotDone, recommendations, generatedAt }
+ * @param {object} data { tripName, projectName?, visitDate, responsible, workDone, workNotDone, recommendations, generatedAt }
  * @param {Buffer[]} photos массив буферов изображений (фото выезда), видео не включаются
  * @param {object} [options] { brand }
  * @returns {Promise<Buffer>}
@@ -61,7 +61,7 @@ export function buildVisitPdf(data, photos = [], options = {}) {
         margin: PAGE.margin,
         bufferPages: true, // нужно для подвала/нумерации в конце
         info: {
-          Title: `Отчёт о выполненных работах — ${data.projectName || ""}`.trim(),
+          Title: `Отчёт о выполненных работах — ${data.tripName || data.projectName || ""}`.trim(),
           Author: "Бизнесмакет",
           Subject: "Заключительный отчёт о выезде",
         },
@@ -197,7 +197,8 @@ function drawHeader(doc, data, left, right, contentW) {
 
 function drawMetaCard(doc, data, brand, left, contentW, ensureSpace) {
   const rows = [
-    ["Проект", valueOr(data.projectName, "—")],
+    ["Выезд", valueOr(data.tripName || data.projectName, "—")],
+    ...(data.projectName ? [["Проект", data.projectName]] : []),
     ["Дата выезда", valueOr(data.visitDate, "—")],
     ["Исполнитель работ", valueOr(data.responsible, "—")],
   ];
