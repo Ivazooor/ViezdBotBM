@@ -70,10 +70,10 @@ const MINIAPP_OK = /^https:\/\/\S+$/i.test(MINIAPP_URL) && !MINIAPP_URL.includes
 // Кого упоминать в вопросе «выезд выполнен?» (ответственный за финальный статус).
 const STATUS_MENTION = (process.env.STATUS_MENTION || "@matiyver").trim();
 // Кого тегать отдельным сообщением при заключительном отчёте (для уведомления).
-// Упоминание по ID (tg://user?id=) уведомляет участников чата даже без username.
+// Руководителя упоминаем по ID, второго адресата — по его актуальному username.
 const NOTIFY_FINAL = [
   { id: "1504488231", name: "Руководитель" },
-  { id: "508570326", name: "@danil_mck" },
+  { username: "murraserebra" },
 ];
 
 // ===== Тексты чек-листов (как в прежнем приложении) =====
@@ -1278,10 +1278,12 @@ async function submitReport(chatId, userId, from) {
       logEvent("error", "quality buttons error:", error.message);
     }
 
-    // Третье сообщение — тег ответственных (для уведомления), упоминание по ID.
+    // Третье сообщение — тег ответственных для уведомления.
     try {
       const mentions = NOTIFY_FINAL
-        .map((u) => `<a href="tg://user?id=${u.id}">${htmlEscape(u.name)}</a>`)
+        .map((u) => u.id
+          ? `<a href="tg://user?id=${u.id}">${htmlEscape(u.name)}</a>`
+          : `@${htmlEscape(u.username)}`)
         .join(" ");
       await tg("sendMessage", {
         chat_id: TARGET_CHAT_ID,
