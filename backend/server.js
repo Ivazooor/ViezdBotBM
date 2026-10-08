@@ -27,11 +27,14 @@ const EXTRA_ALLOWED_IDS =
 const ALLOWED_USER_IDS = [
   ...new Set([...parseIds(process.env.ALLOWED_USER_IDS), ...parseIds(EXTRA_ALLOWED_IDS)]),
 ];
-// Кто может оценивать качество выезда кнопками в рабочем чате. Зашиты по умолчанию
-// (этим людям также автоматически открыт доступ к боту), переопределяется через .env.
+// Кто может оценивать качество выезда кнопками в рабочем чате.
+// Базовый список можно переопределить через .env; передачу прав ниже сохраняем обязательно.
 const DEFAULT_REVIEWER_IDS =
-  "814705792,508570326,165912761,163743492,1090755229,1504488231,898159043,466665113,758274157,97782197,369094962";
-const QUALITY_REVIEWER_IDS = parseIds(process.env.QUALITY_REVIEWER_IDS || DEFAULT_REVIEWER_IDS);
+  "814705792,165912761,163743492,1090755229,1504488231,898159043,466665113,758274157,97782197,369094962";
+// Передача права оценки действует и при старом списке QUALITY_REVIEWER_IDS на сервере.
+const QUALITY_REVIEWER_IDS = [
+  ...new Set([...parseIds(process.env.QUALITY_REVIEWER_IDS || DEFAULT_REVIEWER_IDS), "898159043"]),
+].filter((id) => id !== "508570326");
 const PORT = Number(process.env.PORT) || 3000;
 
 const API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
