@@ -18,7 +18,7 @@ Telegram-бот для отдела выездов: сотрудник созд�
 - `ALLOWED_USER_IDS` — Telegram ID сотрудников через запятую.
 
 CRM API с поддержкой `visitReportsVersion: 2` и правильным `sourceChatId` следует выпустить до обновления бота.
-Дисковую очередь `data/report-outbox.json` нужно сохранять при перезапуске и переезде сервера.
+Дисковые очереди `data/report-outbox.json` и `data/waiting-outbox.json` нужно сохранять при перезапуске и переезде сервера.
 
 ```bash
 npm install

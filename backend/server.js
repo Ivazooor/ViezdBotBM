@@ -2,8 +2,10 @@ import express from "express";
 import dotenv from "dotenv";
 import fetch from "node-fetch";
 import { fileURLToPath } from "node:url";
-import { randomBytes } from "node:crypto";
+import path from "node:path";
+import { createHmac, randomBytes } from "node:crypto";
 import { ReportOutbox } from "./report-outbox.js";
+import { WaitingOutbox } from "./waiting-outbox.js";
 import { normalizeMessageIds, copyReportMessages } from "./report-delivery.js";
 import { buildVisitPdf } from "./pdf.js";
 
@@ -59,6 +61,8 @@ const BM_API_URL = (process.env.BM_API_URL || "https://xn----8sbbqciguqh9br.xn--
 const BM_API_TOKEN = (process.env.BM_API_TOKEN || "").trim();
 const REPORT_OUTBOX_PATH = (process.env.REPORT_OUTBOX_PATH || fileURLToPath(new URL("../data/report-outbox.json", import.meta.url))).trim();
 const reportOutbox = new ReportOutbox(REPORT_OUTBOX_PATH);
+const WAITING_OUTBOX_PATH = (process.env.WAITING_OUTBOX_PATH || path.join(path.dirname(REPORT_OUTBOX_PATH), "waiting-outbox.json")).trim();
+const waitingOutbox = new WaitingOutbox(WAITING_OUTBOX_PATH);
 // [MINIAPP] Мини-приложение «Приложение по выездам» — информационное окно внутри Telegram:
 // свои выезды (задачи, фото задачи, контакт заказчика) и итоги по качеству. Отчёты по-прежнему
 // оформляются здесь, в боте. Требование Telegram: только https-адрес.
@@ -511,6 +515,102 @@ async function pollReportJobs() {
     logEvent("error", "report_jobs:", error.message);
   } finally {
     reportJobsPolling = false;
+  }
+}
+
+// Заявки «Жду» хранятся на сайте. Бот отправляет их адресатам в личные сообщения
+// и подтверждает каждый адрес отдельно, чтобы сбой одного получателя не терял остальных.
+let waitingPolling = false;
+const WAIT_API_URL = new URL("./waiting_bot.php", BM_API_URL).toString();
+const WAIT_API_KEY = createHmac("sha256", "WebAppData").update(TELEGRAM_BOT_TOKEN).digest();
+async function bmWaitApi(payload) {
+  const body = JSON.stringify(payload);
+  let lastError;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const ts = String(Math.floor(Date.now() / 1000));
+    const signature = createHmac("sha256", WAIT_API_KEY).update(ts + "\n" + body).digest("hex");
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    try {
+      const response = await fetch(WAIT_API_URL, { method: "POST", body,
+        headers: { "Content-Type": "application/json", "X-BM-Wait-Ts": ts, "X-BM-Wait-Signature": signature },
+        signal: controller.signal });
+      const data = await response.json();
+      if (!data.ok) {
+        const error = new Error(data.error || `waiting api ${response.status}`);
+        error.permanent = response.status < 500;
+        error.status = response.status;
+        throw error;
+      }
+      return data;
+    } catch (error) {
+      lastError = error;
+      if (error.permanent) throw error;
+      if (attempt < 2) await sleep(1000 * (attempt + 1));
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  throw lastError;
+}
+async function pollWaitingJobs() {
+  if (waitingPolling || !bmEnabled()) return;
+  waitingPolling = true;
+  try {
+    for (const [key, receipt] of waitingOutbox.entries()) {
+      try {
+        await bmWaitApi({ op: "wait_ack", ...receipt });
+        waitingOutbox.remove(key);
+      } catch (error) {
+        logEvent("warn", "wait_ack:", error.message);
+        if (error.status === 404 || error.status === 409) waitingOutbox.remove(key);
+      }
+    }
+    // Не просим новые задания, пока сайт не принял все уже отправленные
+    // сообщения: иначе истёкший lease вернёт их в pending и создаст дубли.
+    if (waitingOutbox.entries().length) return;
+    const data = await bmWaitApi({ op: "wait_jobs" });
+    if (!Array.isArray(data.jobs)) throw new Error("wait_jobs: отсутствует массив jobs");
+    for (const job of data.jobs) {
+      const id = String(job.id || "");
+      const chatId = String(job.chatId || "");
+      const key = id + ":" + chatId;
+      if (!/^[a-f0-9]{24}$/.test(id) || !/^[0-9]{5,20}$/.test(chatId) || waitingOutbox.has(key)) continue;
+      // Сервер помечает получателя ДО обращения к Telegram. После рестарта
+      // неподтверждённая отправка не повторится сама и не создаст дубль.
+      const claimId = randomBytes(12).toString("hex");
+      const claim = await bmWaitApi({ op: "wait_claim", id, chatId, claimId });
+      if (!claim.claimed) continue;
+      // Сохраняем намерение ДО запроса к Telegram. Если процесс остановится
+      // после принятия сообщения, при рестарте отметим исход неизвестным,
+      // а не отправим его второй раз автоматически.
+      waitingOutbox.save(key, { id, chatId, claimId, stage: "intent", delivered: false,
+        uncertain: true, error: "Бот перезапустился во время отправки; проверьте чат перед повтором" });
+      let receipt;
+      try {
+        // При таймауте Telegram мог уже принять сообщение. Не повторяем сетевой
+        // запрос автоматически: такая заявка останется видимой как неподтверждённая.
+        await tg("sendMessage", { chat_id: chatId, text: String(job.text || "") }, 65000, false);
+        receipt = { id, chatId, claimId, delivered: true };
+      } catch (error) {
+        receipt = { id, chatId, claimId, delivered: false, uncertain: !!error.uncertain,
+          error: error.uncertain ? "Исход отправки не подтверждён Telegram; проверьте чат перед повтором"
+            : String(error.message || error).slice(0, 200) };
+        logEvent("warn", "Жду: сообщение не доставлено", chatId, receipt.error);
+      }
+      waitingOutbox.save(key, receipt);
+      try {
+        await bmWaitApi({ op: "wait_ack", ...receipt });
+        waitingOutbox.remove(key);
+      } catch (error) {
+        logEvent("warn", "wait_ack:", error.message);
+        if (error.status === 404 || error.status === 409) waitingOutbox.remove(key);
+      }
+    }
+  } catch (error) {
+    logEvent("error", "wait_jobs:", error.message);
+  } finally {
+    waitingPolling = false;
   }
 }
 
@@ -2089,4 +2189,6 @@ app.listen(PORT, "0.0.0.0", async () => {
   // Отдельный короткий цикл для запросов из мини-приложения; не ждёт long polling getUpdates.
   pollReportJobs();
   setInterval(pollReportJobs, REPORT_JOBS_POLL_MS);
+  pollWaitingJobs();
+  setInterval(pollWaitingJobs, 10000);
 });
