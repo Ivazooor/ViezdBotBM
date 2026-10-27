@@ -590,7 +590,8 @@ async function pollWaitingJobs() {
       try {
         // При таймауте Telegram мог уже принять сообщение. Не повторяем сетевой
         // запрос автоматически: такая заявка останется видимой как неподтверждённая.
-        await tg("sendMessage", { chat_id: chatId, text: String(job.text || "") }, 65000, false);
+        await tg("sendMessage", { chat_id: chatId, text: String(job.text || ""),
+          ...(job.replyMarkup ? { reply_markup: job.replyMarkup } : {}) }, 65000, false);
         receipt = { id, chatId, claimId, delivered: true };
       } catch (error) {
         receipt = { id, chatId, claimId, delivered: false, uncertain: !!error.uncertain,
@@ -1857,6 +1858,23 @@ async function handleCallback(callback) {
   const chatId = callback.message.chat.id;
   const userId = callback.from.id;
   const data = callback.data;
+
+  // Paid-trip receipt is authorized by the current CRM Telegram binding, independently
+  // of the report-writer allowlist. Never use callback message ownership as proof.
+  if (/^tpaid:[a-f0-9]{24}$/.test(data || "")) {
+    try {
+      await bmWaitApi({ op: "trip_paid_ack", id: data.slice(6), telegramUser: String(userId) });
+      await tg("answerCallbackQuery", { callback_query_id: callback.id, text: "Отдел продаж в курсе ✓" });
+      await tg("editMessageReplyMarkup", { chat_id: chatId, message_id: callback.message.message_id,
+        reply_markup: { inline_keyboard: [] } }).catch(() => {});
+      await sendMessage(chatId, "✓ Отдел продаж в курсе. Подтверждение сохранено в карточке выезда.");
+    } catch (error) {
+      await tg("answerCallbackQuery", { callback_query_id: callback.id,
+        text: error.status === 403 ? "Подтвердить может только Владимир Буклей с действующим входом в мини-приложение."
+          : "Не удалось подтвердить. Откройте приложение или повторите позже.", show_alert: true });
+    }
+    return;
+  }
 
   // Кнопки оценки качества (в рабочем чате) — отдельная ветка со своей проверкой прав.
   // callback может нести tripId после «|» (quality_ok|<id>).
