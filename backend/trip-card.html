@@ -1,0 +1,84 @@
+<style>
+  .bm-card {
+    border: 1px solid light-dark(#FFFFFF,#596678);
+    border-radius: 18px;
+    padding: 13px;
+    color: light-dark(#181C23,#F4F6FA);
+    background: radial-gradient(ellipse at 100% 0%,light-dark(#FCF1C1,#5A5133),transparent 64%),
+      light-dark(#F4F7FC,#303844);
+    font-family: system-ui,sans-serif;
+  }
+  .bm-label,.bm-meta,.bm-note { font-size: 12px; color: light-dark(#505866,#C0C8D6); }
+  .bm-label { font-weight: 600; color: light-dark(#245A9E,#D1E5FF); }
+  h3 { margin: 3px 0 5px; font-size: 18px; font-weight:600; overflow-wrap:anywhere; }
+  .bm-status { margin: 5px 0 8px; font-weight: 600; }
+  .bm-status[data-tone=good] { color: light-dark(#076652,#8DE5B3); }
+  .bm-status[data-tone=bad] { color: light-dark(#991B1B,#FF9AAA); }
+  .bm-line { display:flex; flex-wrap:wrap; justify-content:space-between; gap:3px 8px; padding:4px 0; border-top:1px solid light-dark(#DFE3E8,#596678); font-size:13px; }
+  .bm-actions { display:flex; flex-wrap:wrap; gap:5px; margin-top:8px; }
+  button { min-height: 40px; padding:6px 10px; border:0; border-radius:12px; color:light-dark(#245A9E,#D1E5FF); background:light-dark(#DEEBFF,#334B64); font-weight:500; }
+  button.primary { background:light-dark(#F6DF43,#F6DF63); color:#292710; }
+  .bm-note { margin-top:6px; }
+</style>
+<section class="bm-card">
+  <div class="bm-label">БИЗНЕСМАКЕТ · ВЫЕЗД</div>
+  <h3 id="title">Карточка выезда</h3>
+  <div id="details">
+    <div class="bm-meta" id="date"></div>
+    <div class="bm-status" id="status"></div>
+    <div class="bm-line"><span>Предварительный</span><b id="prelim"></b></div>
+    <div class="bm-line"><span>Заключительный</span><b id="final"></b></div>
+    <div class="bm-line" id="photo-count"><span>Фото задания</span><b id="count"></b></div>
+  </div>
+  <div class="bm-actions">
+    <button class="primary" id="open">Открыть выезд ↗</button>
+    <button id="photos">Фото задания</button>
+    <button id="refresh">Обновить</button>
+  </div>
+  <div class="bm-note" id="note" aria-live="polite"></div>
+</section>
+<script>
+(() => {
+  const widget = window.TelegramWidget;
+  const get = id => document.getElementById(id);
+  let card = {};
+  let busy = false;
+  function draw() {
+    try { card = JSON.parse(widget.chatData || "{}"); } catch (_) { card = {}; }
+    get("title").textContent = card.title || "Карточка выезда";
+    get("details").hidden = !!card.unavailable;
+    get("date").textContent = card.date || "";
+    get("status").textContent = card.status || "";
+    get("status").dataset.tone = card.tone || "";
+    get("prelim").textContent = card.prelim ? "✓ Сдан" : "Ожидается";
+    get("final").textContent = card.final ? "✓ Сдан" : "Ожидается";
+    get("photo-count").hidden = !!card.open || !card.photos;
+    get("count").textContent = card.photos || "";
+    get("open").hidden = !card.open;
+    get("photos").hidden = !card.photoOpen;
+    get("photos").textContent = "Фото задания · " + (card.photos || 0);
+    get("refresh").disabled = busy || !card.ref;
+    get("note").textContent = card.updated ? "Данные на " + card.updated + " МСК" : "";
+  }
+  get("open").addEventListener("click", () => widget.openTelegramLink(card.open));
+  get("photos").addEventListener("click", () => widget.openTelegramLink(card.photoOpen));
+  get("refresh").addEventListener("click", () => {
+    if (busy || !card.ref) return;
+    busy = true;
+    get("refresh").disabled = true;
+    get("note").textContent = "Обновляю…";
+    widget.request("bmcard:" + card.ref).then(answer => {
+      draw();
+      get("note").textContent = answer.result || "Карточка обновлена.";
+    }, () => { get("note").textContent = "Обновление недоступно. Повторите позже."; }).finally(() => {
+      busy = false;
+      get("refresh").disabled = !card.ref;
+    });
+  });
+  if (widget) {
+    widget.onEvent("chatDataChanged", draw);
+    draw();
+    widget.ready();
+  }
+})();
+</script>

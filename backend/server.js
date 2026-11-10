@@ -8,6 +8,8 @@ import { ReportOutbox } from "./report-outbox.js";
 import { WaitingOutbox } from "./waiting-outbox.js";
 import { normalizeMessageIds, copyReportMessages } from "./report-delivery.js";
 import { buildVisitPdf } from "./pdf.js";
+import { createTripCards } from "./trip-cards.js";
+import { changeTaskPicker, newTaskPicker, taskCallback, taskPickerPanel, taskPickerText } from "./trip-task-picker.js";
 
 dotenv.config();
 
@@ -38,6 +40,7 @@ const QUALITY_REVIEWER_IDS = [
   ...new Set([...parseIds(process.env.QUALITY_REVIEWER_IDS || DEFAULT_REVIEWER_IDS), "898159043"]),
 ].filter((id) => id !== "508570326");
 const PORT = Number(process.env.PORT) || 3000;
+const BIND_HOST = process.env.BIND_HOST || "0.0.0.0";
 
 const API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 const FILE_API = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}`;
@@ -205,6 +208,18 @@ function sendMessage(chatId, text, replyMarkup) {
   return tg("sendMessage", params);
 }
 
+function panelMessage(title, details, rows) {
+  return {
+    text: [title, ...details.filter(Boolean)].join("\n"),
+    entities: [{ type: "bold", offset: 0, length: title.length }],
+    reply_markup: { inline_keyboard: rows },
+  };
+}
+
+function sendPanel(chatId, title, details, rows) {
+  return tg("sendMessage", { chat_id: chatId, ...panelMessage(title, details, rows) });
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -270,7 +285,7 @@ function bmEnabled() {
   return Boolean(BM_API_TOKEN);
 }
 
-async function bmApi(method, payload = {}) {
+async function bmApi(method, payload = {}, { attempts = 3, timeoutMs = 15000 } = {}) {
   if (!BM_API_TOKEN) throw new Error("BM_API_TOKEN не задан");
   const opts = { method, headers: { "X-Bot-Token": BM_API_TOKEN } };
   let url = BM_API_URL;
@@ -286,9 +301,9 @@ async function bmApi(method, payload = {}) {
   // Срок каждого обращения ограничен: зависший сайт не должен останавливать выдачу.
   // Для report_jobs тело с тем же claimId повторяется после любой сетевой неопределённости.
   let lastErr;
-  for (let attempt = 0; attempt <= 2; attempt++) {
+  for (let attempt = 0; attempt < attempts; attempt++) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 15000);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     let response;
     try {
       response = await fetch(url, { ...opts, signal: controller.signal });
@@ -300,7 +315,7 @@ async function bmApi(method, payload = {}) {
       lastErr = error;
       if (error.permanent) throw error;
       // Прочие POST-операции с неоднозначным ответом уже обязаны быть идемпотентны.
-      if (attempt < 2) {
+      if (attempt + 1 < attempts) {
         logEvent("warn", "bmApi", payload.op || method, "сеть/ответ, повтор " + (attempt + 1));
         await sleep(1000 * (attempt + 1));
       }
@@ -310,6 +325,20 @@ async function bmApi(method, payload = {}) {
   }
   throw lastErr || new Error("bmApi: не удалось");
 }
+
+const tripCards = process.env.BM_TRIP_CARDS === "1" ? createTripCards({
+  tg,
+  miniAppUrl: MINIAPP_URL,
+  miniAppLink: process.env.BM_MINIAPP_DIRECT_LINK,
+  botUsername: BOT_USERNAME,
+  warn: message => logEvent("warn", message),
+  async readTrips(userId, ref) {
+    const payload = { op: "my_trip_cards", uid: String(userId) };
+    if (ref) payload.ref = ref;
+    const data = await bmApi("GET", payload, { attempts: 1, timeoutMs: 4500 });
+    return data.trips;
+  },
+}) : null;
 
 // Список незавершённых выездов для выбора в боте.
 async function bmGetTrips() {
@@ -615,28 +644,24 @@ async function pollWaitingJobs() {
   }
 }
 
-// Дата выезда «YYYY-MM-DD» → «ДД / месяц словом» (без года); иначе как есть.
+// Дата выезда без года, чтобы в кнопке осталось место для названия.
 const MONTHS_RU = ["январь", "февраль", "март", "апрель", "май", "июнь",
   "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"];
+const tripDateFormat = new Intl.DateTimeFormat("ru-RU", { day: "numeric", month: "long", timeZone: "UTC" });
 function tripDateShort(date) {
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(date || ""));
-  if (!m) return String(date || "");
-  const day = parseInt(m[3], 10);
-  const month = MONTHS_RU[parseInt(m[2], 10) - 1] || m[2];
-  return `${day} / ${month}`;
+  const text = String(date || "");
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return text;
+  const value = new Date(text);
+  return Number.isFinite(value.getTime()) ? tripDateFormat.format(value) : text;
 }
-// Подпись выезда на кнопке: «Название / Фамилия / ДД месяц» (без машинки).
+// Статус помогает выбрать ту же карточку для обоих отчётов.
 function tripLabel(t) {
-  const parts = [t.name || "Без названия"];
-  if (t.responsible) parts.push(String(t.responsible).trim().split(/\s+/)[0]); // только фамилия
-  const d = tripDateShort(t.date);
-  if (d) parts.push(d);
-  let label = parts.join(" / ").slice(0, 54);
-  // Маркер уже полученных отчётов: подсказывает выбрать ТУ ЖЕ карточку для заключительного отчёта,
-  // что и для предварительного — иначе отметки разойдутся по разным выездам и «качественный» не откроется.
-  if (t.final) label += " ✅✅отчёты";
-  else if (t.prelim) label += " ✅предв.";
-  return label.slice(0, 64);
+  const status = t.final ? "отчёты сданы" : t.prelim ? "предв. сдан" : "";
+  const responsible = String(t.responsible || "").trim().split(/\s+/)[0];
+  const details = [tripDateShort(t.date), responsible, status].filter(Boolean).join(" · ");
+  const suffix = details ? " · " + details : "";
+  const name = String(t.name || "Без названия").slice(0, Math.max(12, 64 - suffix.length));
+  return (name + suffix).slice(0, 64);
 }
 
 // ===== Клавиатуры =====
@@ -647,12 +672,13 @@ function tripLabel(t) {
 function typeKeyboardFor(chatId, noWebApp) {
   const isPrivate = Number(chatId) > 0;
   const appBtn = (isPrivate && MINIAPP_OK && !noWebApp)
-    ? { text: "🚗 Приложение по выездам", web_app: { url: MINIAPP_URL } }
-    : { text: "🚗 Приложение по выездам", url: `https://t.me/${BOT_USERNAME}` };
+    ? { text: "Открыть приложение по выездам ↗", web_app: { url: MINIAPP_URL } }
+    : { text: "Открыть приложение по выездам ↗", url: `https://t.me/${BOT_USERNAME}` };
   return {
     inline_keyboard: [
-      [{ text: "🟦 Предварительный отчет", callback_data: "type_pre" }],
-      [{ text: "✅ Заключительный отчет", callback_data: "type_final" }],
+      [{ text: "Предварительный отчёт", callback_data: "type_pre", style: "primary" }],
+      [{ text: "Заключительный отчёт", callback_data: "type_final", style: "primary" }],
+      ...(isPrivate && tripCards ? [[{ text: "Мои выезды · карточки", callback_data: "bmcards" }]] : []),
       [appBtn],
     ],
   };
@@ -660,17 +686,17 @@ function typeKeyboardFor(chatId, noWebApp) {
 // Отправка стартового меню. Если Telegram по какой-то причине не принял кнопку мини-приложения
 // (BUTTON_TYPE_INVALID и т.п.), повторяем БЕЗ неё — сотрудник в любом случае получает меню
 // и может сдать отчёт. Молчащий бот здесь недопустим.
-const MENU_TEXT = "Привет! Выбери что требуется:";
 async function sendTypeMenu(chatId) {
+  const details = ["Выберите отчёт или откройте приложение."];
   try {
-    return await sendMessage(chatId, MENU_TEXT, typeKeyboardFor(chatId));
+    return await sendPanel(chatId, "Выезды и отчёты", details, typeKeyboardFor(chatId).inline_keyboard);
   } catch (error) {
     logEvent("error", "меню с кнопкой мини-приложения не ушло:", error.message);
-    return sendMessage(chatId, MENU_TEXT, typeKeyboardFor(chatId, true));
+    return sendPanel(chatId, "Выезды и отчёты", details, typeKeyboardFor(chatId, true).inline_keyboard);
   }
 }
 const checklistKeyboard = {
-  inline_keyboard: [[{ text: "Всё проверил — продолжить", callback_data: "checklist_ok" }]],
+  inline_keyboard: [[{ text: "Всё проверил — продолжить", callback_data: "checklist_ok", style: "primary" }]],
 };
 const commentKeyboard = {
   inline_keyboard: [[{ text: "Пропустить", callback_data: "skip_comment" }]],
@@ -698,7 +724,7 @@ const recommendationsKeyboard = {
 };
 const mediaKeyboard = {
   inline_keyboard: [
-    [{ text: "📤 Отправить отчёт", callback_data: "send_report" }],
+    [{ text: "Отправить отчёт", callback_data: "send_report", style: "primary" }],
     [{ text: "❌ Отменить", callback_data: "cancel" }],
   ],
 };
@@ -711,7 +737,7 @@ const qualityKeyboard = {
 };
 const confirmKeyboard = {
   inline_keyboard: [
-    [{ text: "✅ Подтвердить и отправить", callback_data: "confirm_send" }],
+    [{ text: "Подтвердить и отправить", callback_data: "confirm_send", style: "success" }],
     [{ text: "➕ Добавить ещё файлы", callback_data: "add_more" }],
     [{ text: "❌ Отменить", callback_data: "cancel" }],
   ],
@@ -783,10 +809,11 @@ async function goChecklist(chatId, session) {
   session.step = "checklist";
   const items = CHECKLISTS[session.data.reportType === "final" ? "final" : "pre"];
   const list = items.map((t, i) => `${i + 1}. ${t}`).join("\n");
-  await sendMessage(
+  await sendPanel(
     chatId,
-    `Тип: ${reportTypeLabel(session.data.reportType)}.\n\nПроверьте перед отправкой:\n\n${list}`,
-    checklistKeyboard
+    "Проверьте перед отправкой",
+    [reportTypeLabel(session.data.reportType), "", list],
+    checklistKeyboard.inline_keyboard
   );
 }
 
@@ -872,26 +899,92 @@ async function offerTripChoice(chatId, session, page = 0, useCached = false) {
     if (currentPage + 1 < pageCount) navigation.push({ text: "Далее →", callback_data: `pick_page_${session.tripChoiceToken}_${currentPage + 1}` });
     rows.push(navigation);
   }
-  rows.push([{ text: "➕ Новый выезд — нет в списке", callback_data: "pick_create" }]);
+  rows.push([{ text: "+ Новый выезд", callback_data: "pick_create", style: "primary" }]);
+  rows.push([{ text: "← В меню", callback_data: "back_start" }]);
 
   session.step = "picktrip";
-  const head = session.tripList.length
-    ? `Выберите выезд из отдела «Выезды» (${currentPage + 1}/${pageCount}) или заведите новый:`
-    : "Незавершённых выездов в приложении нет — заведите новый.";
-  await sendMessage(chatId, head, { inline_keyboard: rows });
+  const details = [reportTypeLabel(session.data.reportType), session.tripList.length
+    ? "Выберите карточку. Если выезда нет в списке, создайте новый."
+    : "В списке пока нет незавершённых выездов."];
+  if (pageCount > 1) details.push("Страница " + (currentPage + 1) + " из " + pageCount);
+  await sendPanel(chatId, "Выберите выезд", details, rows);
 }
 
 // ===== Новый выезд: название → задачи (оба поля обязательны) =====
 function askNewTripName(chatId, session) {
   session.step = "newtrip_name";
-  // Без связи с приложением карточка не заведётся — не обещаем того, чего не будет.
-  return sendMessage(chatId, bmEnabled()
-    ? "Как называется выезд? Напишите название — оно станет названием карточки в приложении.\n\nНапример: ЖК «Прайм Парк», макет 1:500"
-    : "Как называется выезд? Напишите название — оно попадёт в заголовок отчёта.\n\nНапример: ЖК «Прайм Парк», макет 1:500");
+  return sendPanel(chatId, "Новый выезд", ["Напишите название, например ЖК «Прайм Парк»."], [
+    [{ text: "← К выездам", callback_data: "name_back" }, { text: "Отмена", callback_data: "cancel", style: "danger" }],
+  ]);
 }
+
+async function renderTaskPicker(chatId, session, edit = false) {
+  const picker = session.taskPicker;
+  const { title, details, rows } = taskPickerPanel(picker, session.data.tripName);
+  const panel = panelMessage(title, details, rows);
+  if (edit) {
+    try {
+      return await tg("editMessageText", { chat_id: chatId, message_id: picker.messageId, ...panel });
+    } catch (error) {
+      if (/message is not modified/i.test(error.message)) return;
+      // Историческое сообщение больше не может менять выбор.
+      picker.token = newTaskPicker().token;
+      return renderTaskPicker(chatId, session);
+    }
+  }
+  const message = await tg("sendMessage", { chat_id: chatId, ...panel });
+  picker.messageId = message.message_id;
+}
+
 function askNewTripTasks(chatId, session) {
   session.step = "newtrip_tasks";
-  return sendMessage(chatId, `Выезд: ${session.data.tripName}\n\nЧто нужно сделать на выезде? Перечислите задачи — они ${bmEnabled() ? "попадут в карточку выезда" : "войдут в отчёт"}.`);
+  session.taskPicker = newTaskPicker();
+  return renderTaskPicker(chatId, session);
+}
+
+function closeTaskPicker(chatId, session, tasks = "") {
+  const picker = session.taskPicker;
+  delete session.taskPicker;
+  if (picker?.messageId) {
+    if (tasks) {
+      const panel = panelMessage("Задачи выбраны", [tasks.slice(0, 3000)], []);
+      return tg("editMessageText", { chat_id: chatId, message_id: picker.messageId, ...panel }).catch(() => {});
+    }
+    return tg("editMessageReplyMarkup", {
+      chat_id: chatId, message_id: picker.messageId, reply_markup: { inline_keyboard: [] },
+    }).catch(() => {});
+  }
+}
+
+async function completeTripTasks(chatId, session, tasks) {
+  session.data.tripTasks = tasks;
+  session.data.comment = tasks;
+  session.step = "checklist";
+  await closeTaskPicker(chatId, session, tasks);
+  return goChecklist(chatId, session);
+}
+
+async function handleTaskPicker(callback, session, match) {
+  const chatId = callback.message.chat.id;
+  const picker = session.taskPicker;
+  const action = match[2];
+  const answer = text => tg("answerCallbackQuery", { callback_query_id: callback.id, text });
+  if (callback.message.chat.type !== "private" || session.step !== "newtrip_tasks" ||
+      picker?.token !== match[1] || picker.messageId !== callback.message.message_id) {
+    return answer("Используйте последнее меню задач.");
+  }
+  if (action === "done" && (picker.manual || !picker.selected.size)) {
+    return answer("Выберите хотя бы одну задачу.");
+  }
+  await answer();
+  if (action === "done") return completeTripTasks(chatId, session, taskPickerText(picker));
+  if (action === "back" || action === "cancel") {
+    await closeTaskPicker(chatId, session);
+    if (action === "back") return offerTripChoice(chatId, session);
+    return startReport(chatId, callback.from.id);
+  }
+  changeTaskPicker(picker, action);
+  return renderTaskPicker(chatId, session, true);
 }
 
 // ===== Режим просмотра выездов (кнопка «Посмотреть выезды» в стартовом меню) =====
@@ -1435,6 +1528,9 @@ async function handleMessage(message) {
 
   const text = (message.text || "").trim();
 
+  if (tripCards && text === "/cards") {
+    return tripCards.showList(chatId, userId);
+  }
   if (text === "/start" || text === "/new") {
     await startReport(chatId, userId);
     return;
@@ -1481,7 +1577,10 @@ async function handleMessage(message) {
   if (incomingMedia && session.step !== "media" && session.step !== "confirm" && session.step !== "idle") {
     if (!session.earlyMediaHint) {
       session.earlyMediaHint = true;
-      await sendMessage(chatId, "Фото и видео попрошу чуть позже — сейчас ответьте текстом на вопрос выше.");
+      const picking = session.step === "newtrip_tasks" && !session.taskPicker?.manual;
+      await sendMessage(chatId, picking
+        ? "Сначала выберите задачи кнопками. Фото и видео можно добавить на следующем этапе."
+        : "Фото и видео попрошу чуть позже — сейчас ответьте текстом на вопрос выше.");
       setTimeout(() => { const ss = sessions.get(userId); if (ss) ss.earlyMediaHint = false; }, 20000);
     }
     return;
@@ -1528,10 +1627,9 @@ async function handleMessage(message) {
 
     case "newtrip_tasks": {
       const tasks = (text || "").trim();
-      if (!tasks) return sendMessage(chatId, "Перечислите задачи текстом — без них карточка выезда будет пустой.");
-      session.data.tripTasks = tasks;
-      session.data.comment = tasks;         // в отчёт идут те же задачи
-      return goChecklist(chatId, session);
+      if (!tasks) return;
+      const picker = session.taskPicker;
+      return completeTripTasks(chatId, session, picker ? taskPickerText(picker, tasks) : tasks);
     }
 
     case "register_fio": {
@@ -1859,6 +1957,14 @@ async function handleCallback(callback) {
   const userId = callback.from.id;
   const data = callback.data;
 
+  if ((data === "bmcards" || /^bmcard:[a-f0-9]{24}$/.test(data || "")) && tripCards) {
+    const allowed = callback.message.chat.type === "private" && chatId === userId && isAllowed(userId);
+    await tg("answerCallbackQuery", { callback_query_id: callback.id, ...(allowed ? {} : { text: "Карточки доступны в личном чате." }) });
+    if (!allowed) return;
+    if (data === "bmcards") return tripCards.showList(chatId, userId);
+    return tripCards.showCard(chatId, userId, data.slice(7));
+  }
+
   // Paid-trip receipt is authorized by the current CRM Telegram binding, independently
   // of the report-writer allowlist. Never use callback message ownership as proof.
   if (/^tpaid:[a-f0-9]{24}$/.test(data || "")) {
@@ -1892,21 +1998,21 @@ async function handleCallback(callback) {
     return;
   }
 
-  await tg("answerCallbackQuery", { callback_query_id: callback.id });
-
   const session = getSession(userId);
-
-  // Пока бот ждёт НАЗВАНИЕ или ЗАДАЧИ, кнопки из старых сообщений не действуют. Иначе нажатие
-  // «📅 Сегодня» или «Пропустить» в прошлой переписке перепрыгивало обязательный шаг: отчёт уходил
-  // в чат с «Проект: undefined», а в приложении заводилась карточка без названия и задач.
-  // Исключения — выход из тупика: начать заново и отменить.
+  const taskMatch = taskCallback.exec(data);
+  if (taskMatch) return handleTaskPicker(callback, session, taskMatch);
+  if (data === "name_back" && session.step === "newtrip_name") {
+    await tg("answerCallbackQuery", { callback_query_id: callback.id });
+    return offerTripChoice(chatId, session);
+  }
+  // Старые кнопки не должны перепрыгивать обязательные шаги названия и задач.
   if ((session.step === "newtrip_name" || session.step === "newtrip_tasks")
       && data !== "back_start" && data !== "cancel") {
-    await sendMessage(chatId, session.step === "newtrip_name"
-      ? "Сначала напишите название выезда текстом (или /cancel, чтобы отменить)."
-      : "Сначала перечислите задачи текстом (или /cancel, чтобы отменить).");
-    return;
+    return tg("answerCallbackQuery", {
+      callback_query_id: callback.id, text: "Продолжите в последнем сообщении бота.",
+    });
   }
+  await tg("answerCallbackQuery", { callback_query_id: callback.id });
 
   // Режим просмотра выездов (без оформления отчёта).
   // [MINIAPP] Кнопок «Посмотреть выезды» и «Сводка за месяц» в меню больше нет — их заменило
@@ -1992,13 +2098,8 @@ async function handleCallback(callback) {
     }
     // Задачи выбранной карточки показываем как справку — заново их вводить не нужно.
     if (session.data.tripId && session.data.reportType !== "final") {
-      if (session.data.tripTasks) {
-        await sendMessage(chatId, `📋 Задачи по выезду «${session.data.tripName}»:\n${session.data.tripTasks}`);
-      } else {
-        // В карточке задач нет — без них отчёт бессмысленный, спрашиваем.
-        await sendMessage(chatId, `📋 В карточке выезда «${session.data.tripName}» задачи не заполнены.`);
-        return askNewTripTasks(chatId, session);
-      }
+      if (!session.data.tripTasks) return askNewTripTasks(chatId, session);
+      await sendMessage(chatId, "Задачи из карточки выезда\n" + session.data.tripTasks);
     }
     await goChecklist(chatId, session);
     return;
@@ -2141,6 +2242,12 @@ async function handleCallback(callback) {
 }
 
 async function handleUpdate(update) {
+  if (tripCards && update.widget_query) {
+    const query = update.widget_query;
+    void tripCards.refresh(query, isAllowed(query.from?.id))
+      .catch(() => logEvent("warn", "Карточка выезда: запрос виджета не обработан"));
+    return;
+  }
   if (update.message) return handleMessage(update.message);
   if (update.callback_query) return handleCallback(update.callback_query);
 }
@@ -2154,7 +2261,7 @@ async function poll() {
       const updates = await tg("getUpdates", {
         offset,
         timeout: 50,
-        allowed_updates: ["message", "callback_query"],
+        allowed_updates: ["message", "callback_query", ...(tripCards ? ["widget_query"] : [])],
       });
       for (const update of updates) {
         offset = update.update_id + 1;
@@ -2185,7 +2292,7 @@ app.get("*", (_req, res) => {
   res.type("html").send("<h1>Бот выездных фотоотчётов работает</h1><p>Откройте бота в Telegram и отправьте /start.</p>");
 });
 
-app.listen(PORT, "0.0.0.0", async () => {
+app.listen(PORT, BIND_HOST, async () => {
   console.log(`HTTP server on port ${PORT}`);
   if (!TELEGRAM_BOT_TOKEN || !TARGET_CHAT_ID || !BM_API_TOKEN) {
     logEvent("error", "Telegram/KPI интеграция не настроена; приём отчётов остановлен");
