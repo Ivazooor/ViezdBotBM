@@ -790,6 +790,12 @@ function htmlEscape(s) {
 
 const DATE_PROMPT = "Чтобы изменить дату выезда, отправьте её сообщением в формате ДД.ММ.ГГГГ.";
 
+function showReportStep(chatId, session, title, details, keyboard = null, stage = 1) {
+  return reportPanels.send(chatId, session, {
+    title, details, stage, rows: keyboard?.inline_keyboard || [],
+  });
+}
+
 function sendReportMedia(chatId, session, notice = "") {
   const details = [notice || "Пришлите фото и видео через скрепку в чате. Можно отправить несколько альбомов."];
   return reportPanels.send(chatId, session, {
@@ -873,7 +879,11 @@ function showTypeMenu(chatId, session) {
 async function goChecklist(chatId, session) {
   session.step = "checklist";
   const final = session.data.reportType === "final";
-  const details = CHECKLISTS[final ? "final" : "pre"].map(item => "• " + item);
+  const details = [
+    session.data.tripName,
+    session.data.linkedProjectName && "Проект · " + session.data.linkedProjectName,
+    ...CHECKLISTS[final ? "final" : "pre"].map(item => "• " + item),
+  ].filter(Boolean);
   return reportPanels.send(chatId, session, {
     title: final ? "После завершения работ" : "Перед началом работ",
     details,
@@ -886,11 +896,11 @@ async function goChecklist(chatId, session) {
 async function askResponsibleOrSkip(chatId, session) {
   if (session.profileFio) {
     session.data.responsible = session.profileFio;
-    await sendMessage(chatId, `Ответственное лицо: ${session.profileFio} (из профиля).`);
+    if (!session.reportWidget) await sendMessage(chatId, `Ответственное лицо: ${session.profileFio} (из профиля).`);
     return goAfterResponsible(chatId, session);
   }
   session.step = "responsible";
-  return sendMessage(chatId, "Кто ответственное лицо?");
+  return showReportStep(chatId, session, "Ответственное лицо", ["Отправьте ФИО сообщением в чате."]);
 }
 
 // Шаги после ответственного лица (зависят от типа отчёта).
@@ -916,7 +926,7 @@ async function goAfterResponsible(chatId, session) {
   }
   // Задач нет только в запасном сценарии (приложение недоступно) — тогда спрашиваем.
   session.step = "comment";
-  return sendMessage(chatId, "Укажите перечень задач на данном выезде или нажмите «Пропустить».", commentKeyboard);
+  return showReportStep(chatId, session, "Задачи на выезд", ["Укажите задачи сообщением в чате или нажмите «Пропустить»."], commentKeyboard);
 }
 
 function tripChoicePanel(session, entries, page, count) {
@@ -925,19 +935,18 @@ function tripChoicePanel(session, entries, page, count) {
   const rows = entries.map(({ trip, index }) => {
     // CRM ID может быть длиннее лимита Telegram callback_data (64 байта).
     const action = `pick_i${session.tripChoiceToken}_${index}`;
-    const card = {
-      title: trip.name || "Без названия",
-      project: trip.projectName,
-      detail: [tripDateShort(trip.date), trip.responsible].filter(Boolean).join(" · "),
-      warning: session.data.reportType === "final" && !trip.prelim ? "Нет предварительной фиксации" : "",
-    };
-    cards[action] = card;
+    const name = trip.name || "Без названия";
+    const title = Array.from(name);
+    const warning = session.data.reportType === "final" && !trip.prelim ? "Нет предварительной фиксации" : "";
+    const shortDate = /^\d{4}-(\d{2})-(\d{2})$/.exec(String(trip.date || ""));
+    const date = shortDate ? shortDate[2] + "." + shortDate[1] : "";
+    cards[action] = { title: title.length > 46 ? title.slice(0, 32).join("").trimEnd() + "…" + title.slice(-13).join("").trimStart() : name, detail: date, warning };
     const number = index + 1;
     listDetails.push([
-      number + ". " + card.title,
-      card.project && "Проект · " + card.project,
-      card.detail,
-      card.warning && "⚠ " + card.warning,
+      number + ". " + name,
+      trip.projectName && "Проект · " + trip.projectName,
+      [tripDateShort(trip.date), trip.responsible].filter(Boolean).join(" · "),
+      warning && "⚠ " + warning,
     ].filter(Boolean).join("\n"));
     return [{ text: number + ". " + tripLabel(trip).slice(0, 56), callback_data: action }];
   });
@@ -962,7 +971,7 @@ function tripChoicePages(session) {
     const page = pages.at(-1);
     const canAdd = session.classicReport
       ? page.length < 15
-      : page.length < 4 && reportWidgetFits(tripChoicePanel(session, [...page, entry], 1, 9999));
+      : page.length < 7 && reportWidgetFits(tripChoicePanel(session, [...page, entry], 1, 9999));
     if (!page.length || canAdd) page.push(entry);
     else pages.push([entry]);
   }
@@ -974,8 +983,10 @@ async function offerTripChoice(chatId, session, page = 0, useCached = false) {
   // Интеграция должна быть доступна до оформления отчёта.
   if (!bmEnabled()) {
     session.step = "type";
-    await sendMessage(chatId, "⚠️ Связь с программой выездов не настроена. Отчёт сейчас нельзя привязать к карточке и найти через поиск. Попробуйте позже.");
-    return;
+    return showReportStep(chatId, session, "Связь с приложением недоступна",
+      ["Попробуйте оформить отчёт позже."], {
+        inline_keyboard: [[{ text: "← В меню", callback_data: "back_start" }]],
+      }, 0);
   }
 
   let trips = [];
@@ -987,13 +998,14 @@ async function offerTripChoice(chatId, session, page = 0, useCached = false) {
     // Не уводим сразу в «новый выезд»: при короткой сетевой икоте так появился бы дубль карточки
     // уже существующего выезда. Даём выбор — повторить список или всё же завести новый.
     session.step = "picktrip";
-    await sendMessage(chatId,
-      "⚠️ Не удалось получить список выездов из приложения.\n\nПопробуйте ещё раз — или заведите новый выезд, если его в списке и не было.",
-      { inline_keyboard: [
-        [{ text: "🔄 Повторить список", callback_data: "pick_retry" }],
-        [{ text: "➕ Завести новый выезд", callback_data: "pick_create" }],
-      ] });
-    return;
+    return showReportStep(chatId, session, "Список выездов недоступен",
+      ["Попробуйте ещё раз. Если выезд ещё не создан, можно завести новый."], {
+        inline_keyboard: [
+          [{ text: "Повторить список", callback_data: "pick_retry", style: "primary" }],
+          [{ text: "+ Новый выезд", callback_data: "pick_create" }],
+          [{ text: "← В меню", callback_data: "back_start" }],
+        ],
+      }, 0);
   }
 
   if (!fromCache || !session.tripPages) {
@@ -1012,14 +1024,30 @@ async function offerTripChoice(chatId, session, page = 0, useCached = false) {
 // ===== Новый выезд: название → задачи (оба поля обязательны) =====
 function askNewTripName(chatId, session) {
   session.step = "newtrip_name";
-  return sendPanel(chatId, "Новый выезд", ["Напишите название, например ЖК «Прайм Парк»."], [
-    [{ text: "← К выездам", callback_data: "name_back" }, { text: "Отмена", callback_data: "cancel", style: "danger" }],
-  ]);
+  return showReportStep(chatId, session, "Новый выезд", ["Отправьте название сообщением в чате, например ЖК «Прайм Парк»."], {
+    inline_keyboard: [[{ text: "← К выездам", callback_data: "name_back" }, { text: "Отмена", callback_data: "cancel", style: "danger" }]],
+  }, 0);
 }
 
 async function renderTaskPicker(chatId, session, edit = false) {
   const picker = session.taskPicker;
   const { title, details, rows } = taskPickerPanel(picker, session.data.tripName);
+  if (session.reportWidget) {
+    const compactLabels = ["Осмотр макета", "Монтаж макета", "Проверка подсветки", "Проверка интерактива",
+      "Устранение замечаний", "Демонтаж и упаковка"];
+    const compactButtons = rows.slice(0, 6).map(([button], index) => ({
+      ...button, text: (picker.selected.has(index) ? "✓ " : "") + compactLabels[index],
+    }));
+    const widgetRows = picker.manual ? rows : [
+      ...[0, 2, 4].map(index => [compactButtons[index], compactButtons[index + 1]]),
+      ...rows.slice(6),
+    ];
+    const message = await reportPanels.send(chatId, session, {
+      title, details, rows: widgetRows, fallbackRows: rows, stage: 1,
+    });
+    if (!session.reportWidget && message?.message_id) picker.messageId = message.message_id;
+    return;
+  }
   const panel = panelMessage(title, details, rows);
   if (edit) {
     try {
@@ -1033,6 +1061,16 @@ async function renderTaskPicker(chatId, session, edit = false) {
   }
   const message = await tg("sendMessage", { chat_id: chatId, ...panel });
   picker.messageId = message.message_id;
+}
+
+async function resumeReportClassic(chatId, session) {
+  if (session.step === "newtrip_tasks" && session.taskPicker) {
+    session.classicReport = true;
+    delete session.reportWidget;
+    await renderTaskPicker(chatId, session);
+    return true;
+  }
+  return reportPanels.resumeClassic(chatId, session);
 }
 
 function askNewTripTasks(chatId, session) {
@@ -1076,11 +1114,19 @@ async function handleTaskPicker(callback, session, match) {
     return answer("Выберите хотя бы одну задачу.");
   }
   await answer();
-  if (action === "done") return completeTripTasks(chatId, session, taskPickerText(picker));
+  return applyTaskPicker(chatId, callback.from.id, session, action);
+}
+
+async function applyTaskPicker(chatId, userId, session, action) {
+  const picker = session.taskPicker;
+  if (action === "done") {
+    if (picker.manual || !picker.selected.size) return renderTaskPicker(chatId, session, true);
+    return completeTripTasks(chatId, session, taskPickerText(picker));
+  }
   if (action === "back" || action === "cancel") {
     await closeTaskPicker(chatId, session);
     if (action === "back") return offerTripChoice(chatId, session);
-    return startReport(chatId, callback.from.id);
+    return handleReportAction(chatId, userId, session, "back_start", { id: userId });
   }
   changeTaskPicker(picker, action);
   return renderTaskPicker(chatId, session, true);
@@ -1285,16 +1331,14 @@ async function submitReport(chatId, userId, from) {
   } catch (error) {
     logEvent("error", "target header error:", error.message);
     session.submitting = false;
-    await sendMessage(
-      chatId,
-      "❌ Не удалось отправить в рабочий чат. Проверьте, что бот добавлен в группу и может писать сообщения. " +
-        "Данные сохранены — нажмите «Подтвердить и отправить» ещё раз.",
-      confirmKeyboard
-    );
-    return;
+    return showReportStep(chatId, session, "Не удалось отправить в рабочий чат",
+      ["Данные сохранены. Проверьте доступ бота к чату и повторите отправку."], confirmKeyboard, 3);
   }
 
-  await sendMessage(chatId, "Отправляю файлы…").catch((error) => {
+  const progress = session.reportWidget
+    ? showReportStep(chatId, session, "Отправляю отчёт", ["Пересылаю вложения в рабочий чат."], null, 3)
+    : sendMessage(chatId, "Отправляю файлы…");
+  await progress.catch((error) => {
     logEvent("warn", "private progress message:", error.message);
   });
 
@@ -1330,11 +1374,8 @@ async function submitReport(chatId, userId, from) {
 
   if (sent === 0) {
     session.submitting = false;
-    await sendMessage(chatId,
-      "❌ Ни один файл не дошёл до рабочего чата. Данные отчёта сохранены — нажмите «Подтвердить и отправить» ещё раз.",
-      confirmKeyboard
-    );
-    return;
+    return showReportStep(chatId, session, "Файлы не дошли до рабочего чата",
+      ["Отчёт сохранён в черновике. Повторите отправку или добавьте файлы."], confirmKeyboard, 3);
   }
 
   const report = {
@@ -1366,6 +1407,12 @@ async function submitReport(chatId, userId, from) {
     }
   }
 
+  let indexNote = "";
+  async function showIndexResult(text) {
+    if (session.reportWidget) indexNote = text;
+    else await sendMessage(chatId, text).catch(() => {});
+  }
+
   // Предварительный отчёт: пометить карточку выезда в приложении (если выезд выбран из списка).
   // Бот отмечает trip.checks.prelim → в KPI-приложении видно «Предварительный отчёт ✓».
   // Новый выезд в предварительном отчёте: сначала заводим карточку, потом ставим отметку.
@@ -1382,16 +1429,16 @@ async function submitReport(chatId, userId, from) {
       });
       if (created && created.id) {
         d.tripId = created.id;
-        await sendMessage(chatId, `✅ В приложении создана карточка выезда «${d.tripName || d.projectName}» с задачами.`).catch(() => {});
+        await showIndexResult(`✅ В приложении создана карточка выезда «${d.tripName || d.projectName}» с задачами.`);
       }
     } catch (error) {
       logEvent("error", "bm create (pre):", error.message);
-      await sendMessage(chatId,
+      await showIndexResult(
         "⚠️ Отчёт отправлен в чат, но карточка выезда пока не создана: " + error.message +
         (error.indexQueued
           ? "\n\nБот сохранил запрос на повтор. Не создавайте карточку вручную, чтобы не получить дубль."
           : "\n\nСообщите руководителю: автоматический повтор недоступен.")
-      ).catch(() => {});
+      );
     }
   }
   if (d.reportType !== "final" && bmEnabled() && d.tripId && !d.tripCreate) {
@@ -1399,33 +1446,36 @@ async function submitReport(chatId, userId, from) {
       const prelim = { op: "preliminary", tripId: d.tripId, tasks: d.tripTasks || d.comment || "", by: senderName(from), report };
       await postReportWithOutbox(prelim, { op: "attach_report", tripId: d.tripId, report });
       logEvent("info", "Отметка предварительного отчёта поставлена, tripId=" + d.tripId);
-      await sendMessage(chatId,
+      await showIndexResult(
         `✅ Бот отметил в карточке выезда${d.tripName ? " «" + d.tripName + "»" : ""}: предварительный отчёт получен.`
-      ).catch(() => {});
+      );
     } catch (error) {
       logEvent("error", "bm preliminary mark:", error.message);
-      await sendMessage(chatId,
+      await showIndexResult(
         "⚠️ Предварительный отчёт отправлен в чат, но отметку в карточке поставить не удалось: " + error.message +
         (error.indexAttached
           ? "\n\nФайлы уже доступны через поиск. Проверьте отметку отчёта и задачи в карточке выезда."
           : error.indexQueued
             ? "\n\nБот повторит сохранение файлов для поиска. Отметку нужно проверить в карточке выезда."
             : "\n\nСообщите руководителю: автоматический повтор недоступен.")
-      ).catch(() => {});
+      );
     }
   } else if (d.reportType !== "final" && bmEnabled() && !d.tripId && !d.tripCreate) {
     // Выезд не выбран из списка → отмечать нечего. Предупреждаем сразу, чтобы «качественный» потом не оказался заблокирован.
-    await sendMessage(chatId,
+    await showIndexResult(
       "⚠️ Выезд не был выбран из списка, поэтому отметка «предварительный отчёт получен» в карточке не проставлена.\n\n" +
       "Чтобы выезд можно было отметить «качественным», отправьте предварительный отчёт ещё раз через /start и выберите выезд из списка."
-    ).catch(() => {});
+    );
   }
 
   // Фирменный PDF-отчёт для заказчика — только по заключительному выезду.
   let pdfNote = "";
   if (d.reportType === "final") {
     try {
-      await sendMessage(chatId, "Формирую фирменный PDF-отчёт для заказчика…").catch((error) => {
+      const pdfProgress = session.reportWidget
+        ? showReportStep(chatId, session, "Формирую PDF", ["Вложения уже отправлены в рабочий чат."], null, 3)
+        : sendMessage(chatId, "Формирую фирменный PDF-отчёт для заказчика…");
+      await pdfProgress.catch((error) => {
         logEvent("warn", "private PDF progress message:", error.message);
       });
       const photoIds = session.media
@@ -1511,10 +1561,10 @@ async function submitReport(chatId, userId, from) {
           });
           kpiTripId = created.id || null;
           // Новая карточка → есть только заключительный отчёт; предупреждаем, иначе «качественный» будет заблокирован.
-          await sendMessage(chatId,
+          await showIndexResult(
             `✅ Создана карточка выезда «${d.tripName || d.projectName}» с отметкой «заключительный отчёт получен».\n\n` +
             "⚠️ В этой карточке нет предварительного отчёта — «качественный» откроется только после того, как по этому же выезду поступит и предварительный отчёт."
-          ).catch(() => {});
+          );
         } else if (kpiTripId) {
           const finalReport = {
             op: "final_report",
@@ -1526,27 +1576,27 @@ async function submitReport(chatId, userId, from) {
             report,
           };
           await postReportWithOutbox(finalReport, { op: "attach_report", tripId: kpiTripId, report });
-          await sendMessage(chatId,
+          await showIndexResult(
             `✅ Бот отметил в карточке выезда${d.tripName ? " «" + d.tripName + "»" : ""}: заключительный отчёт получен.`
-          ).catch(() => {});
+          );
         } else {
           // Выезд не выбран и карточка не создана → отмечать нечего. Сообщаем, чтобы отметку не искали зря.
-          await sendMessage(chatId,
+          await showIndexResult(
             "⚠️ Выезд не был выбран из списка, поэтому отметка «заключительный отчёт получен» в карточке не проставлена.\n\n" +
             "Отправьте заключительный отчёт ещё раз через /start и выберите выезд из списка (тот же, что и для предварительного отчёта)."
-          ).catch(() => {});
+          );
         }
       } catch (error) {
         logEvent("error", "bm kpi-запись:", error.message);
         // [B1] Не молчим: отчёт ушёл в чат, но в карточку выезда (приложение) не записался.
-        await sendMessage(chatId,
+        await showIndexResult(
           "⚠️ Отчёт отправлен в рабочий чат, но запись в карточке выезда не завершена: " + error.message +
           (error.indexAttached
             ? "\n\nФайлы уже доступны через поиск. Проверьте отметку отчёта и тексты работ в карточке выезда."
             : error.indexQueued
               ? "\n\nБот сохранил запрос на повтор. Не создавайте карточку вручную, чтобы не получить дубль."
               : "\n\nСообщите руководителю: автоматический повтор недоступен.")
-        ).catch(() => {});
+        );
       }
     }
 
@@ -1591,7 +1641,15 @@ async function submitReport(chatId, userId, from) {
     }
   }
 
-  resetSession(userId);
+  const next = resetSession(userId);
+  if (sent > 0 && session.reportWidget) {
+    next.reportWidget = session.reportWidget;
+    next.profileFio = session.profileFio;
+    const receipt = sent < total ? "Файлов переслано: " + sent + " из " + total + "." : "Файлов переслано: " + sent + ".";
+    return showReportStep(chatId, next, "Отчёт отправлен в рабочий чат", [receipt, indexNote, pdfNote.trim()], {
+      inline_keyboard: [[{ text: "Новый отчёт", callback_data: "back_start", style: "primary" }]],
+    }, 3);
+  }
 
   if (sent > 0) {
     const tail = sent < total ? ` (из ${total}; ${total - sent} не удалось)` : "";
@@ -1633,7 +1691,7 @@ async function handleMessage(message) {
   if (text === "/report_classic") {
     const session = getSession(userId);
     if (session.step === "idle") return startReport(chatId, userId, true);
-    if (!await reportPanels.resumeClassic(chatId, session)) {
+    if (!await resumeReportClassic(chatId, session)) {
       await sendMessage(chatId, "Обычный режим включён. Продолжите в последнем сообщении бота.");
     }
     return;
@@ -1773,13 +1831,13 @@ async function handleMessage(message) {
       if (!text) return sendMessage(chatId, "Опишите выполненные работы текстом.");
       session.data.workDone = text;
       session.step = "worknotdone";
-      return sendMessage(chatId, "Какие работы не выполнены (если есть) и почему? Опишите или нажмите «Всё выполнено».", workNotDoneKeyboard);
+      return showReportStep(chatId, session, "Невыполненные работы", ["Опишите причину сообщением в чате или нажмите «Всё выполнено»."], workNotDoneKeyboard);
 
     case "worknotdone":
       if (!text) return sendMessage(chatId, "Опишите невыполненные работы или нажмите «Всё выполнено».");
       session.data.workNotDone = text;
       session.step = "recommendations";
-      return sendMessage(chatId, "Рекомендации по макету (если есть)? Опишите или нажмите «Рекомендаций нет».", recommendationsKeyboard);
+      return showReportStep(chatId, session, "Рекомендации", ["Отправьте рекомендации сообщением в чате или нажмите «Рекомендаций нет»."], recommendationsKeyboard);
 
     case "recommendations":
       if (!text) return sendMessage(chatId, "Опишите рекомендации или нажмите «Рекомендаций нет».");
@@ -2110,6 +2168,13 @@ async function handleCallback(callback) {
     return tg("answerCallbackQuery", { callback_query_id: callback.id, text: "Отчёты оформляются в личном чате." });
   }
   const session = getSession(userId);
+  if (data === "report_classic") {
+    const same = session.reportWidget?.messageId === callback.message.message_id;
+    await tg("answerCallbackQuery", { callback_query_id: callback.id,
+      ...(same ? {} : { text: "Откройте последнее сообщение бота." }) });
+    if (same) return resumeReportClassic(chatId, session);
+    return;
+  }
   const separateMenu = /^(?:view_|sum_|summary_menu$|back_start$)/.test(data);
   if (!separateMenu && session.reportWidget?.step === session.step &&
       session.reportWidget.messageId !== callback.message.message_id) {
@@ -2155,10 +2220,21 @@ async function handleCallback(callback) {
 }
 
 async function handleReportAction(chatId, userId, session, data, from) {
+  const task = taskCallback.exec(data);
+  if (task && session.step === "newtrip_tasks" && session.taskPicker?.token === task[1]) {
+    return applyTaskPicker(chatId, userId, session, task[2]);
+  }
   if (data === "bmcards" && tripCards) return tripCards.showList(chatId, userId);
   if (data === "back_start") {
-    await startReport(chatId, userId, session.classicReport);
-    return;
+    if (!session.reportWidget) return startReport(chatId, userId, session.classicReport);
+    const next = resetSession(userId);
+    next.profileFio = session.profileFio;
+    next.reportWidget = session.reportWidget;
+    return showTypeMenu(chatId, next);
+  }
+
+  if (data === "name_back" && session.step === "newtrip_name") {
+    return offerTripChoice(chatId, session, 0, true);
   }
 
   if (data === "type_pre" || data === "type_final") {
@@ -2251,7 +2327,7 @@ async function handleReportAction(chatId, userId, session, data, from) {
   if (data === "date_now") {
     if (session.step !== "date") return;
     session.data.visitDate ||= nowMoscow();
-    await sendMessage(chatId, `Дата выезда: ${session.data.visitDate}`);
+    if (!session.reportWidget) await sendMessage(chatId, `Дата выезда: ${session.data.visitDate}`);
     await askResponsibleOrSkip(chatId, session);
     return;
   }
@@ -2280,39 +2356,27 @@ async function handleReportAction(chatId, userId, session, data, from) {
   // Заключительный: вставить задачи из карточки в «выполненные работы» → предложить оставить/отредактировать.
   if (data === "use_tasks_done" && session.step === "workdone") {
     session.data.workDone = session.data.tripTasks || "";
-    await sendMessage(
-      chatId,
-      `Подставлены задачи как выполненные работы:\n${session.data.workDone}\n\nЕсли выполнено всё — «Оставить как есть». Если что-то не выполнили — «Отредактировать» и пришлите исправленный список.`,
-      workDoneConfirmKeyboard
-    );
-    return;
+    return showReportStep(chatId, session, "Выполненные работы",
+      [session.data.workDone, "Можно оставить этот текст или отредактировать его."], workDoneConfirmKeyboard);
   }
 
   // Оставить подставленные задачи как выполненные работы и идти дальше.
   if (data === "workdone_keep" && session.step === "workdone") {
     session.step = "worknotdone";
-    await sendMessage(
-      chatId,
-      "Какие работы не выполнены (если есть) и почему? Опишите или нажмите «Всё выполнено».",
-      workNotDoneKeyboard
-    );
-    return;
+    return showReportStep(chatId, session, "Невыполненные работы", ["Опишите причину сообщением в чате или нажмите «Всё выполнено»."], workNotDoneKeyboard);
   }
 
   // Отредактировать список выполненных работ вручную.
   if (data === "workdone_edit" && session.step === "workdone") {
     session.step = "workdone";
-    await sendMessage(
-      chatId,
-      `Пришлите отредактированный список выполненных работ (скопируйте и уберите лишнее):\n${session.data.tripTasks || ""}`
-    );
-    return;
+    return showReportStep(chatId, session, "Редактирование работ",
+      ["Отправьте исправленный список сообщением в чате.", session.data.tripTasks]);
   }
 
   if (data === "work_all_done" && session.step === "worknotdone") {
     session.data.workNotDone = "Всё выполнено";
     session.step = "recommendations";
-    await sendMessage(chatId, "Рекомендации по макету (если есть)? Опишите или нажмите «Рекомендаций нет».", recommendationsKeyboard);
+    await showReportStep(chatId, session, "Рекомендации", ["Отправьте рекомендации сообщением в чате или нажмите «Рекомендаций нет»."], recommendationsKeyboard);
     return;
   }
 
@@ -2350,6 +2414,7 @@ async function handleReportAction(chatId, userId, session, data, from) {
   }
 
   if (data === "cancel" && ["newtrip_name", "newtrip_tasks", "media", "confirm"].includes(session.step)) {
+    if (session.reportWidget) return handleReportAction(chatId, userId, session, "back_start", from);
     resetSession(userId);
     await sendMessage(chatId, "Отменено. Чтобы начать заново — /start.");
     return;
@@ -2364,6 +2429,7 @@ async function handleUpdate(update) {
     const action = await reportPanels.receive(query, session, isAllowed(userId));
     if (!action) return;
     if (!action.callback_data) {
+      if (await reportPanels.showLink(userId, session, action)) return;
       return sendMessage(userId, action.text, { inline_keyboard: [[action]] });
     }
     return handleReportAction(userId, userId, session, action.callback_data, query.from);
