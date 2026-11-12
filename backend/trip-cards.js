@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 
 const html = readFileSync(new URL("trip-card.html", import.meta.url), "utf8");
 const refPattern = /^[a-f0-9]{24}$/;
@@ -165,5 +166,12 @@ export function createTripCards({ tg, readTrips, miniAppUrl, miniAppLink, botUse
     return finish(card.unavailable ? "Карточка недоступна." : "Карточка обновлена.");
   }
 
-  return { showList, showCard, refresh };
+  async function reportPhotoButton(userId, tripId) {
+    const ref = createHash("sha256").update(String(tripId)).digest("hex").slice(0, 24);
+    const trip = (await getCards(userId, ref)).find(item => item.ref === ref);
+    if (!trip || !(trip.photos > 0)) return null;
+    return fallbackButtons(trip)?.inline_keyboard[1]?.[0] || null;
+  }
+
+  return { showList, showCard, refresh, reportPhotoButton };
 }

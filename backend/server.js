@@ -2,6 +2,7 @@ import express from "express";
 import dotenv from "dotenv";
 import fetch from "node-fetch";
 import { fileURLToPath } from "node:url";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { createHmac, randomBytes } from "node:crypto";
 import { ReportOutbox } from "./report-outbox.js";
@@ -9,9 +10,12 @@ import { WaitingOutbox } from "./waiting-outbox.js";
 import { normalizeMessageIds, copyReportMessages } from "./report-delivery.js";
 import { buildVisitPdf } from "./pdf.js";
 import { createTripCards } from "./trip-cards.js";
+import { createReportPanels, isReportWidgetQuery, reportWidgetFits } from "./report-panels.js";
 import { changeTaskPicker, newTaskPicker, taskCallback, taskPickerPanel, taskPickerText } from "./trip-task-picker.js";
 
 dotenv.config();
+
+const BOT_VERSION = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
 
 // ===== Конфигурация =====
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || "").trim();
@@ -89,17 +93,14 @@ const NOTIFY_FINAL = [
 // ===== Тексты чек-листов (как в прежнем приложении) =====
 const CHECKLISTS = {
   pre: [
-    "Сделана фото-фиксация до начала работ.",
-    "Объект снят со всех сторон.",
-    "Макет видно полностью (4–5 фото).",
-    "Детализированы объекты, с которыми и вокруг которых будет идти работа.",
-    "Сделана видео-фиксация до начала работ.",
-    "Сделан видео-облёт: горизонтальное видео, плавно, видно состояние объекта; с демонстрацией интерактива, если он есть.",
+    "Зафиксировать макет со всех сторон, чтобы он умещался полностью.",
+    "Снять крупным планом участки, с которыми предстоят работы.",
+    "Снять видеооблёт всего макета. Если есть интерактив, полностью показать его работу.",
   ],
   final: [
-    "Убран за собой мусор.",
-    "Итоговый фото-отчёт: объект со всех сторон, макет полностью (4–5 фото), детализированы объекты, с которыми велась работа.",
-    "Итоговый видео-отчёт: горизонтальное видео, плавный облёт, видно итоговое состояние; с демонстрацией интерактива, если он есть.",
+    "Убрать мусор после работ.",
+    "Снять макет со всех сторон, сделать 4–5 общих фото и крупные планы участков, на которых велись работы.",
+    "Снять плавный горизонтальный облёт итогового состояния макета и показать интерактив, если он есть.",
   ],
 };
 
@@ -219,6 +220,21 @@ function panelMessage(title, details, rows) {
 function sendPanel(chatId, title, details, rows) {
   return tg("sendMessage", { chat_id: chatId, ...panelMessage(title, details, rows) });
 }
+
+const reportPanels = createReportPanels({
+  tg,
+  async fallback(chatId, title, details, rows) {
+    let text = details.filter(Boolean).join("\n");
+    while (text.length > 3800) {
+      const chars = Array.from(text);
+      const prefix = chars.slice(0, 1800).join("");
+      await sendMessage(chatId, prefix);
+      text = text.slice(prefix.length);
+    }
+    return sendPanel(chatId, title, [text], rows);
+  },
+  warn: message => logEvent("warn", message),
+});
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -686,17 +702,23 @@ function typeKeyboardFor(chatId, noWebApp) {
 // Отправка стартового меню. Если Telegram по какой-то причине не принял кнопку мини-приложения
 // (BUTTON_TYPE_INVALID и т.п.), повторяем БЕЗ неё — сотрудник в любом случае получает меню
 // и может сдать отчёт. Молчащий бот здесь недопустим.
-async function sendTypeMenu(chatId) {
-  const details = ["Выберите отчёт или откройте приложение."];
+async function sendTypeMenu(chatId, session) {
+  const details = ["Выберите фотоотчёт для выезда."];
+  const cards = {
+    type_pre: { title: "Предварительный отчёт", detail: "До начала работ", icon: "▤" },
+    type_final: { title: "Заключительный отчёт", detail: "По итогам работ", icon: "✓", lilac: true },
+  };
   try {
-    return await sendPanel(chatId, "Выезды и отчёты", details, typeKeyboardFor(chatId).inline_keyboard);
+    return await reportPanels.send(chatId, session, {
+      title: "Выезды и отчёты", details, rows: typeKeyboardFor(chatId).inline_keyboard, cards,
+    });
   } catch (error) {
     logEvent("error", "меню с кнопкой мини-приложения не ушло:", error.message);
     return sendPanel(chatId, "Выезды и отчёты", details, typeKeyboardFor(chatId, true).inline_keyboard);
   }
 }
 const checklistKeyboard = {
-  inline_keyboard: [[{ text: "Всё проверил — продолжить", callback_data: "checklist_ok", style: "primary" }]],
+  inline_keyboard: [[{ text: "Продолжить", callback_data: "checklist_ok", style: "primary" }]],
 };
 const commentKeyboard = {
   inline_keyboard: [[{ text: "Пропустить", callback_data: "skip_comment" }]],
@@ -743,7 +765,7 @@ const confirmKeyboard = {
   ],
 };
 const dateKeyboard = {
-  inline_keyboard: [[{ text: "📅 Сегодня (текущие дата и время)", callback_data: "date_now" }]],
+  inline_keyboard: [[{ text: "Продолжить", callback_data: "date_now" }]],
 };
 
 // Текущие дата и время по Москве в формате ДД.ММ.ГГГГ ЧЧ:ММ.
@@ -766,15 +788,58 @@ function htmlEscape(s) {
   return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-const MEDIA_PROMPT =
-  "Теперь пришлите все фото и видео — по одному или альбомом.\nКогда закончите — нажмите «Отправить отчёт».";
-const DATE_PROMPT =
-  "Укажите дату выезда: нажмите «📅 Сегодня» или введите вручную (например, 15.06.2026).";
+const DATE_PROMPT = "Чтобы изменить дату выезда, отправьте её сообщением в формате ДД.ММ.ГГГГ.";
+
+function sendReportMedia(chatId, session, notice = "") {
+  const details = [notice || "Пришлите фото и видео через скрепку в чате. Можно отправить несколько альбомов."];
+  return reportPanels.send(chatId, session, {
+    title: "Фото и видео", details, stage: 2,
+    rows: [
+      [{ text: "Прикрепить файлы", callback_data: "attach_help" }],
+      ...mediaKeyboard.inline_keyboard.map(row => row.map(button => ({ ...button, style: undefined }))),
+    ],
+    fallbackRows: mediaKeyboard.inline_keyboard,
+  });
+}
+
+function sendReportSummary(chatId, session) {
+  const [, ...lines] = buildSummary(session).split("\n").filter(Boolean);
+  lines.pop(); // Вопрос об отправке заменён кнопкой подтверждения.
+  const [confirm, addMore, cancel] = confirmKeyboard.inline_keyboard;
+  return reportPanels.send(chatId, session, {
+    title: "Проверьте отчёт перед отправкой", details: [lines.join("\n")], stage: 3,
+    rows: [confirm, [...addMore, ...cancel]],
+    fallbackRows: confirmKeyboard.inline_keyboard,
+  });
+}
+
+async function reportPhotoButton(chatId, session) {
+  if (!tripCards || !session.data.tripId || Number(chatId) <= 0) return null;
+  try {
+    return await tripCards.reportPhotoButton(chatId, session.data.tripId);
+  } catch {
+    return null;
+  }
+}
+
+async function beginReportDate(chatId, session) {
+  session.step = "date";
+  session.data.visitDate = nowMoscow();
+  const details = ["Дата по Москве · " + session.data.visitDate];
+  if (session.profileFio) details.push("Ответственное лицо · " + session.profileFio);
+  if (session.data.reportType !== "final" && session.data.tripTasks) {
+    details.push("Задачи на выезд\n" + session.data.tripTasks);
+  }
+  details.push(DATE_PROMPT);
+  const photo = session.data.reportType !== "final" ? await reportPhotoButton(chatId, session) : null;
+  const rows = [...(photo ? [[photo]] : []), ...dateKeyboard.inline_keyboard];
+  return reportPanels.send(chatId, session, { title: "Дата выезда", details, rows, stage: 1 });
+}
 
 // ===== Старт нового отчёта =====
-async function startReport(chatId, userId) {
-  resetSession(userId);
-  const session = getSession(userId);
+async function startReport(chatId, userId, classicReport = false) {
+  const session = resetSession(userId);
+  session.classicReport = classicReport;
 
   // Загружаем профиль (ФИО). При первом входе — просим заполнить.
   if (bmEnabled()) {
@@ -795,26 +860,26 @@ async function startReport(chatId, userId) {
   }
 
   session.step = "type";
-  await sendTypeMenu(chatId);
+  await sendTypeMenu(chatId, session);
 }
 
 // Меню выбора типа отчёта (после старта/регистрации).
 function showTypeMenu(chatId, session) {
   session.step = "type";
-  return sendTypeMenu(chatId);
+  return sendTypeMenu(chatId, session);
 }
 
 // Показ чек-листа требований (общий шаг после выбора типа и выезда).
 async function goChecklist(chatId, session) {
   session.step = "checklist";
-  const items = CHECKLISTS[session.data.reportType === "final" ? "final" : "pre"];
-  const list = items.map((t, i) => `${i + 1}. ${t}`).join("\n");
-  await sendPanel(
-    chatId,
-    "Проверьте перед отправкой",
-    [reportTypeLabel(session.data.reportType), "", list],
-    checklistKeyboard.inline_keyboard
-  );
+  const final = session.data.reportType === "final";
+  const details = CHECKLISTS[final ? "final" : "pre"].map(item => "• " + item);
+  return reportPanels.send(chatId, session, {
+    title: final ? "После завершения работ" : "Перед началом работ",
+    details,
+    rows: checklistKeyboard.inline_keyboard,
+    stage: 1,
+  });
 }
 
 // Шаг «ответственное лицо»: если в профиле есть ФИО — подставляем автоматически.
@@ -829,27 +894,79 @@ async function askResponsibleOrSkip(chatId, session) {
 }
 
 // Шаги после ответственного лица (зависят от типа отчёта).
-function goAfterResponsible(chatId, session) {
+async function goAfterResponsible(chatId, session) {
   if (session.data.reportType === "final") {
     session.step = "workdone";
-    return sendMessage(
-      chatId,
-      session.data.tripTasks
-        ? `Перечислите, какие работы выполнены.\n\nЗадачи из карточки выезда:\n${session.data.tripTasks}\n\nОтправьте свой текст, чтобы изменить, или «Использовать задачи» — чтобы вставить задачи из карточки.`
-        : "Перечислите, какие работы выполнены:",
-      session.data.tripTasks ? useTasksDoneKeyboard : undefined
-    );
+    const details = ["Перечислите выполненные работы сообщением в чате."];
+    const rows = [];
+    if (session.data.tripTasks) {
+      details.push("Задачи из карточки выезда\n" + session.data.tripTasks);
+      rows.push(...useTasksDoneKeyboard.inline_keyboard);
+    }
+    const photo = await reportPhotoButton(chatId, session);
+    if (photo) rows.push([photo]);
+    return reportPanels.send(chatId, session, { title: "Итоги работ", details, rows, stage: 1 });
   }
   // Предварительный отчёт: задачи уже известны — они либо взяты из карточки выезда,
   // либо введены при заведении нового выезда. Отдельно спрашивать их не нужно.
   if (session.data.tripTasks) {
     session.data.comment = session.data.tripTasks;
     session.step = "media";
-    return sendMessage(chatId, MEDIA_PROMPT, mediaKeyboard);
+    return sendReportMedia(chatId, session);
   }
   // Задач нет только в запасном сценарии (приложение недоступно) — тогда спрашиваем.
   session.step = "comment";
   return sendMessage(chatId, "Укажите перечень задач на данном выезде или нажмите «Пропустить».", commentKeyboard);
+}
+
+function tripChoicePanel(session, entries, page, count) {
+  const cards = {};
+  const listDetails = [];
+  const rows = entries.map(({ trip, index }) => {
+    // CRM ID может быть длиннее лимита Telegram callback_data (64 байта).
+    const action = `pick_i${session.tripChoiceToken}_${index}`;
+    const card = {
+      title: trip.name || "Без названия",
+      project: trip.projectName,
+      detail: [tripDateShort(trip.date), trip.responsible].filter(Boolean).join(" · "),
+      warning: session.data.reportType === "final" && !trip.prelim ? "Нет предварительной фиксации" : "",
+    };
+    cards[action] = card;
+    const number = index + 1;
+    listDetails.push([
+      number + ". " + card.title,
+      card.project && "Проект · " + card.project,
+      card.detail,
+      card.warning && "⚠ " + card.warning,
+    ].filter(Boolean).join("\n"));
+    return [{ text: number + ". " + tripLabel(trip).slice(0, 56), callback_data: action }];
+  });
+  const navigation = [];
+  if (page > 0) navigation.push({ text: "← Назад", callback_data: `pick_page_${session.tripChoiceToken}_${page - 1}` });
+  if (page + 1 < count) navigation.push({ text: "Далее →", callback_data: `pick_page_${session.tripChoiceToken}_${page + 1}` });
+  if (navigation.length) rows.push(navigation);
+  rows.push([
+    { text: "← В меню", callback_data: "back_start" },
+    { text: "+ Новый выезд", callback_data: "pick_create", style: "primary" },
+  ]);
+  const details = entries.length
+    ? [reportTypeLabel(session.data.reportType) + (count > 1 ? ` · ${page + 1} из ${count}` : "")]
+    : ["В списке пока нет незавершённых выездов."];
+  return { title: "Выберите выезд", details, rows, stage: 0, cards, fallbackDetails: [...details, ...listDetails] };
+}
+
+function tripChoicePages(session) {
+  const pages = [[]];
+  for (const [index, trip] of session.tripList.entries()) {
+    const entry = { trip, index };
+    const page = pages.at(-1);
+    const canAdd = session.classicReport
+      ? page.length < 15
+      : page.length < 4 && reportWidgetFits(tripChoicePanel(session, [...page, entry], 1, 9999));
+    if (!page.length || canAdd) page.push(entry);
+    else pages.push([entry]);
+  }
+  return pages;
 }
 
 // Вторым действием после выбора типа — выбор выезда из отдела «Выезды».
@@ -879,35 +996,17 @@ async function offerTripChoice(chatId, session, page = 0, useCached = false) {
     return;
   }
 
-  session.tripList = trips.filter((t) => t && t.id);
-  if (!fromCache) session.tripChoiceToken = randomBytes(3).toString("hex");
-  session.tripChoices = {};
-  session.tripList.forEach((t) => {
-    session.tripChoices[String(t.id)] = t; // старые кнопки из уже отправленных сообщений
-  });
-  const pageSize = 15;
-  const pageCount = Math.max(1, Math.ceil(session.tripList.length / pageSize));
+  if (!fromCache || !session.tripPages) {
+    session.tripList = trips.filter(trip => trip && trip.id);
+    session.tripChoiceToken = randomBytes(3).toString("hex");
+    session.tripChoices = Object.fromEntries(session.tripList.map(trip => [String(trip.id), trip]));
+    session.tripPages = tripChoicePages(session);
+  }
+  const pageCount = session.tripPages.length;
   const currentPage = Math.max(0, Math.min(Number(page) || 0, pageCount - 1));
-  const rows = [];
-  for (let i = currentPage * pageSize; i < Math.min((currentPage + 1) * pageSize, session.tripList.length); i++) {
-    // CRM ID может быть длиннее лимита Telegram callback_data (64 байта).
-    rows.push([{ text: tripLabel(session.tripList[i]), callback_data: `pick_i${session.tripChoiceToken}_${i}` }]);
-  }
-  if (pageCount > 1) {
-    const navigation = [];
-    if (currentPage > 0) navigation.push({ text: "← Назад", callback_data: `pick_page_${session.tripChoiceToken}_${currentPage - 1}` });
-    if (currentPage + 1 < pageCount) navigation.push({ text: "Далее →", callback_data: `pick_page_${session.tripChoiceToken}_${currentPage + 1}` });
-    rows.push(navigation);
-  }
-  rows.push([{ text: "+ Новый выезд", callback_data: "pick_create", style: "primary" }]);
-  rows.push([{ text: "← В меню", callback_data: "back_start" }]);
-
   session.step = "picktrip";
-  const details = [reportTypeLabel(session.data.reportType), session.tripList.length
-    ? "Выберите карточку. Если выезда нет в списке, создайте новый."
-    : "В списке пока нет незавершённых выездов."];
-  if (pageCount > 1) details.push("Страница " + (currentPage + 1) + " из " + pageCount);
-  await sendPanel(chatId, "Выберите выезд", details, rows);
+  return reportPanels.send(chatId, session,
+    tripChoicePanel(session, session.tripPages[currentPage], currentPage, pageCount));
 }
 
 // ===== Новый выезд: название → задачи (оба поля обязательны) =====
@@ -1531,6 +1630,14 @@ async function handleMessage(message) {
   if (tripCards && text === "/cards") {
     return tripCards.showList(chatId, userId);
   }
+  if (text === "/report_classic") {
+    const session = getSession(userId);
+    if (session.step === "idle") return startReport(chatId, userId, true);
+    if (!await reportPanels.resumeClassic(chatId, session)) {
+      await sendMessage(chatId, "Обычный режим включён. Продолжите в последнем сообщении бота.");
+    }
+    return;
+  }
   if (text === "/start" || text === "/new") {
     await startReport(chatId, userId);
     return;
@@ -1597,11 +1704,12 @@ async function handleMessage(message) {
     } else if (message.video) {
       item.kind = "video";
     }
+    const wasConfirming = session.step === "confirm";
     session.media.push(item);
     session.step = "media";
-    if (!session.mediaHintShown) {
+    if (!session.mediaHintShown || wasConfirming) {
       session.mediaHintShown = true;
-      await sendMessage(chatId, "Файлы принимаются. Присылайте ещё, а когда закончите — «Отправить отчёт».", mediaKeyboard);
+      await sendReportMedia(chatId, session, "Файлы принимаются. Можно добавить ещё.");
     }
     return;
   }
@@ -1677,18 +1785,18 @@ async function handleMessage(message) {
       if (!text) return sendMessage(chatId, "Опишите рекомендации или нажмите «Рекомендаций нет».");
       session.data.recommendations = text;
       session.step = "media";
-      return sendMessage(chatId, MEDIA_PROMPT, mediaKeyboard);
+      return sendReportMedia(chatId, session);
 
     case "comment":
       session.data.comment = text;
       session.step = "media";
-      return sendMessage(chatId, MEDIA_PROMPT, mediaKeyboard);
+      return sendReportMedia(chatId, session);
 
     case "media":
-      return sendMessage(chatId, "Пришлите фото или видео, либо нажмите «Отправить отчёт».", mediaKeyboard);
+      return sendReportMedia(chatId, session);
 
     case "confirm":
-      return sendMessage(chatId, "Нажмите «Подтвердить и отправить» или «Добавить ещё файлы».", confirmKeyboard);
+      return sendReportSummary(chatId, session);
 
     case "picktrip":
       return sendMessage(chatId, "Выберите выезд кнопкой выше или нажмите «➕ Новый выезд — нет в списке».");
@@ -1998,7 +2106,15 @@ async function handleCallback(callback) {
     return;
   }
 
+  if (callback.message.chat.type !== "private" || chatId !== userId) {
+    return tg("answerCallbackQuery", { callback_query_id: callback.id, text: "Отчёты оформляются в личном чате." });
+  }
   const session = getSession(userId);
+  const separateMenu = /^(?:view_|sum_|summary_menu$|back_start$)/.test(data);
+  if (!separateMenu && session.reportWidget?.step === session.step &&
+      session.reportWidget.messageId !== callback.message.message_id) {
+    return tg("answerCallbackQuery", { callback_query_id: callback.id, text: "Откройте последнее сообщение бота." });
+  }
   const taskMatch = taskCallback.exec(data);
   if (taskMatch) return handleTaskPicker(callback, session, taskMatch);
   if (data === "name_back" && session.step === "newtrip_name") {
@@ -2035,12 +2151,18 @@ async function handleCallback(callback) {
     await showMonthSummary(chatId, data.slice(4));
     return;
   }
+  return handleReportAction(chatId, userId, session, data, callback.from);
+}
+
+async function handleReportAction(chatId, userId, session, data, from) {
+  if (data === "bmcards" && tripCards) return tripCards.showList(chatId, userId);
   if (data === "back_start") {
-    await startReport(chatId, userId);
+    await startReport(chatId, userId, session.classicReport);
     return;
   }
 
   if (data === "type_pre" || data === "type_final") {
+    if (session.step !== "type") return;
     session.data.reportType = data === "type_final" ? "final" : "pre";
     // Вторым действием — выбор выезда из отдела «Выезды».
     await offerTripChoice(chatId, session);
@@ -2096,29 +2218,18 @@ async function handleCallback(callback) {
         session.data.projectName = session.data.linkedProjectName || t.name || "";
       }
     }
-    // Задачи выбранной карточки показываем как справку — заново их вводить не нужно.
-    if (session.data.tripId && session.data.reportType !== "final") {
-      if (!session.data.tripTasks) return askNewTripTasks(chatId, session);
-      await sendMessage(chatId, "Задачи из карточки выезда\n" + session.data.tripTasks);
+    if (session.data.tripId && session.data.reportType !== "final" && !session.data.tripTasks) {
+      return askNewTripTasks(chatId, session);
     }
     await goChecklist(chatId, session);
     return;
   }
 
   if (data === "checklist_ok") {
-    if (session.step === "newtrip_name" || session.step === "newtrip_tasks") {
-      await tg("answerCallbackQuery", { callback_query_id: callback.id, text: "Сначала ответьте на вопрос выше", show_alert: true }).catch(() => {});
-      return;
-    }
-    // Отдельного шага «наименование проекта» больше нет: название берётся из карточки выезда,
-    // а у нового выезда его вводят в самом начале. Сразу спрашиваем дату.
+    if (session.step !== "checklist") return;
     if (!session.data.projectName) session.data.projectName = session.data.tripName || "";
-    // Страховка на случай старых кнопок из истории чата: без названия отчёт уйдёт с пустым
-    // «Проект:» — спрашиваем его, а не молчим.
     if (!session.data.projectName) return askNewTripName(chatId, session);
-    session.step = "date";
-    await sendMessage(chatId, DATE_PROMPT, dateKeyboard);
-    return;
+    return beginReportDate(chatId, session);
   }
 
   // Использовать название проекта из выбранной карточки выезда.
@@ -2133,13 +2244,13 @@ async function handleCallback(callback) {
     }
     session.data.projectName = session.data.tripName || "";
     session.data.linkedProjectName = "";
-    session.step = "date";
-    await sendMessage(chatId, `Проект: ${session.data.projectName}\n\n${DATE_PROMPT}`, dateKeyboard);
+    return beginReportDate(chatId, session);
     return;
   }
 
   if (data === "date_now") {
-    session.data.visitDate = nowMoscow();
+    if (session.step !== "date") return;
+    session.data.visitDate ||= nowMoscow();
     await sendMessage(chatId, `Дата выезда: ${session.data.visitDate}`);
     await askResponsibleOrSkip(chatId, session);
     return;
@@ -2154,20 +2265,20 @@ async function handleCallback(callback) {
     }
     session.data.comment = "";
     session.step = "media";
-    await sendMessage(chatId, MEDIA_PROMPT, mediaKeyboard);
+    await sendReportMedia(chatId, session);
     return;
   }
 
   // Вставить задачи из карточки выезда как перечень задач (предварительный).
-  if (data === "use_tasks") {
+  if (data === "use_tasks" && session.step === "comment") {
     session.data.comment = session.data.tripTasks || "";
     session.step = "media";
-    await sendMessage(chatId, MEDIA_PROMPT, mediaKeyboard);
+    await sendReportMedia(chatId, session);
     return;
   }
 
   // Заключительный: вставить задачи из карточки в «выполненные работы» → предложить оставить/отредактировать.
-  if (data === "use_tasks_done") {
+  if (data === "use_tasks_done" && session.step === "workdone") {
     session.data.workDone = session.data.tripTasks || "";
     await sendMessage(
       chatId,
@@ -2178,7 +2289,7 @@ async function handleCallback(callback) {
   }
 
   // Оставить подставленные задачи как выполненные работы и идти дальше.
-  if (data === "workdone_keep") {
+  if (data === "workdone_keep" && session.step === "workdone") {
     session.step = "worknotdone";
     await sendMessage(
       chatId,
@@ -2189,7 +2300,7 @@ async function handleCallback(callback) {
   }
 
   // Отредактировать список выполненных работ вручную.
-  if (data === "workdone_edit") {
+  if (data === "workdone_edit" && session.step === "workdone") {
     session.step = "workdone";
     await sendMessage(
       chatId,
@@ -2198,43 +2309,47 @@ async function handleCallback(callback) {
     return;
   }
 
-  if (data === "work_all_done") {
+  if (data === "work_all_done" && session.step === "worknotdone") {
     session.data.workNotDone = "Всё выполнено";
     session.step = "recommendations";
     await sendMessage(chatId, "Рекомендации по макету (если есть)? Опишите или нажмите «Рекомендаций нет».", recommendationsKeyboard);
     return;
   }
 
-  if (data === "no_recommendations") {
+  if (data === "no_recommendations" && session.step === "recommendations") {
     session.data.recommendations = "Нет";
     session.step = "media";
-    await sendMessage(chatId, MEDIA_PROMPT, mediaKeyboard);
+    await sendReportMedia(chatId, session);
     return;
+  }
+
+  if (data === "attach_help" && session.step === "media") {
+    return sendMessage(chatId, "Нажмите скрепку рядом с полем сообщения Telegram и выберите фото или видео.");
   }
 
   // Кнопка «Отправить отчёт» → показываем сводку для подтверждения.
-  if (data === "send_report") {
+  if (data === "send_report" && session.step === "media") {
     if (!session.media.length) {
-      await sendMessage(chatId, "Вы ещё не прислали ни одного файла. Добавьте фото/видео.", mediaKeyboard);
+      await sendReportMedia(chatId, session, "Добавьте хотя бы одно фото или видео через скрепку в чате.");
       return;
     }
     session.step = "confirm";
-    await sendMessage(chatId, buildSummary(session), confirmKeyboard);
+    await sendReportSummary(chatId, session);
     return;
   }
 
-  if (data === "confirm_send") {
-    await submitReport(chatId, userId, callback.from);
+  if (data === "confirm_send" && session.step === "confirm") {
+    await submitReport(chatId, userId, from);
     return;
   }
 
-  if (data === "add_more") {
+  if (data === "add_more" && session.step === "confirm") {
     session.step = "media";
-    await sendMessage(chatId, "Хорошо, пришлите ещё файлы. Когда закончите — «Отправить отчёт».", mediaKeyboard);
+    await sendReportMedia(chatId, session);
     return;
   }
 
-  if (data === "cancel") {
+  if (data === "cancel" && ["newtrip_name", "newtrip_tasks", "media", "confirm"].includes(session.step)) {
     resetSession(userId);
     await sendMessage(chatId, "Отменено. Чтобы начать заново — /start.");
     return;
@@ -2242,6 +2357,17 @@ async function handleCallback(callback) {
 }
 
 async function handleUpdate(update) {
+  if (update.widget_query && isReportWidgetQuery(update.widget_query)) {
+    const query = update.widget_query;
+    const userId = query.from?.id;
+    const session = sessions.get(userId);
+    const action = await reportPanels.receive(query, session, isAllowed(userId));
+    if (!action) return;
+    if (!action.callback_data) {
+      return sendMessage(userId, action.text, { inline_keyboard: [[action]] });
+    }
+    return handleReportAction(userId, userId, session, action.callback_data, query.from);
+  }
   if (tripCards && update.widget_query) {
     const query = update.widget_query;
     void tripCards.refresh(query, isAllowed(query.from?.id))
@@ -2261,7 +2387,7 @@ async function poll() {
       const updates = await tg("getUpdates", {
         offset,
         timeout: 50,
-        allowed_updates: ["message", "callback_query", ...(tripCards ? ["widget_query"] : [])],
+        allowed_updates: ["message", "callback_query", "widget_query"],
       });
       for (const update of updates) {
         offset = update.update_id + 1;
@@ -2277,7 +2403,7 @@ async function poll() {
 // ===== HTTP-сервер (нужен Render/панели для проверки порта) =====
 const app = express();
 app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, mode: "bot", allowedUsers: ALLOWED_USER_IDS.length, hasTarget: Boolean(TARGET_CHAT_ID) });
+  res.json({ ok: true, mode: "bot", version: BOT_VERSION, allowedUsers: ALLOWED_USER_IDS.length, hasTarget: Boolean(TARGET_CHAT_ID) });
 });
 // Журнал последних событий — защищён токеном (тем же BM_API_TOKEN). Для диагностики.
 app.get("/api/logs", (req, res) => {
