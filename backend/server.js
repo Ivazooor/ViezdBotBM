@@ -80,7 +80,14 @@ const BOT_USERNAME = (process.env.BOT_USERNAME || "bmhpolabot").trim().replace(/
 // #tgWebAppData (из него приложение читает подпись). Кривой адрес Telegram не принимает и отвергает
 // СООБЩЕНИЕ ЦЕЛИКОМ — тогда /start молчал бы у всех. Поэтому при плохом адресе кнопку web_app
 // не ставим вовсе: меню уходит с обычной ссылкой, бот остаётся рабочим.
-const MINIAPP_OK = /^https:\/\/\S+$/i.test(MINIAPP_URL) && !MINIAPP_URL.includes("#");
+const MINIAPP_WEB_URL = (() => {
+  try {
+    const url = new URL(MINIAPP_URL);
+    if (url.protocol === "https:" && !url.username && !url.password && !MINIAPP_URL.includes("#")) return url;
+  } catch {}
+  return null;
+})();
+const MINIAPP_OK = Boolean(MINIAPP_WEB_URL);
 // Кого упоминать в вопросе «выезд выполнен?» (ответственный за финальный статус).
 const STATUS_MENTION = (process.env.STATUS_MENTION || "@matiyver").trim();
 // Кого тегать отдельным сообщением при заключительном отчёте (для уведомления).
@@ -687,14 +694,22 @@ function tripLabel(t) {
 // целиком не уйдёт (BUTTON_TYPE_INVALID). Личный чат = положительный chat_id, группа = отрицательный.
 function typeKeyboardFor(chatId, noWebApp) {
   const isPrivate = Number(chatId) > 0;
-  const appBtn = (isPrivate && MINIAPP_OK && !noWebApp)
-    ? { text: "Открыть приложение по выездам ↗", web_app: { url: MINIAPP_URL } }
+  const canOpenApp = isPrivate && MINIAPP_OK && !noWebApp;
+  const appBtn = canOpenApp
+    ? { text: "Открыть приложение по выездам ↗", web_app: { url: MINIAPP_WEB_URL.href } }
     : { text: "Открыть приложение по выездам ↗", url: `https://t.me/${BOT_USERNAME}` };
+  const searchRows = [];
+  if (canOpenApp) {
+    const search = new URL(MINIAPP_WEB_URL);
+    search.searchParams.set("tab", "search");
+    searchRows.push([{ text: "Поиск выездов", web_app: { url: search.href } }]);
+  }
   return {
     inline_keyboard: [
       [{ text: "Предварительный отчёт", callback_data: "type_pre", style: "primary" }],
       [{ text: "Заключительный отчёт", callback_data: "type_final", style: "primary" }],
       ...(isPrivate && tripCards ? [[{ text: "Мои выезды · карточки", callback_data: "bmcards" }]] : []),
+      ...searchRows,
       [appBtn],
     ],
   };
@@ -708,9 +723,13 @@ async function sendTypeMenu(chatId, session) {
     type_pre: { title: "Предварительный отчёт", detail: "До начала работ", icon: "▤" },
     type_final: { title: "Заключительный отчёт", detail: "По итогам работ", icon: "✓", lilac: true },
   };
+  const fallbackRows = typeKeyboardFor(chatId).inline_keyboard;
+  // Web App открывается штатной кнопкой Telegram прямо из меню одним нажатием.
+  const rows = fallbackRows.filter(row => row.every(button => button.callback_data));
+  const widgetRows = fallbackRows.filter(row => row.some(button => !button.callback_data));
   try {
     return await reportPanels.send(chatId, session, {
-      title: "Выезды и отчёты", details, rows: typeKeyboardFor(chatId).inline_keyboard, cards,
+      title: "Выезды и отчёты", details, rows, cards, fallbackRows, widgetRows,
     });
   } catch (error) {
     logEvent("error", "меню с кнопкой мини-приложения не ушло:", error.message);

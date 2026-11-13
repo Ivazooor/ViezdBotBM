@@ -271,7 +271,14 @@ export function createReportPanels({ tg, fallback, warn }) {
         const id = widget.messageId;
         await request("editMessageWidgetData", { chat_id: chatId, message_id: id, chat_data: chatData });
         session.reportWidget = { ...widget, ...current };
-        if (widget.hasKeyboard) {
+        if (panel.widgetRows?.length) {
+          try {
+            await markup(chatId, id, [...panel.widgetRows, [CLASSIC_BUTTON]]);
+          } catch (error) {
+            if (!/message is not modified/i.test(error.message)) throw error;
+          }
+          session.reportWidget.hasKeyboard = true;
+        } else if (widget.hasKeyboard) {
           try {
             await markup(chatId, id, []);
             session.reportWidget.hasKeyboard = false;
@@ -283,7 +290,7 @@ export function createReportPanels({ tg, fallback, warn }) {
       }
       const message = await request("sendWidget", {
         chat_id: chatId, html: reportWidgetHtml, allow_queries: true, chat_data: chatData,
-        reply_markup: { inline_keyboard: [[CLASSIC_BUTTON]] },
+        reply_markup: { inline_keyboard: [...(panel.widgetRows || []), [CLASSIC_BUTTON]] },
       });
       const hasClassicButton = message.reply_markup?.inline_keyboard?.some(
         row => row.some(button => button.callback_data === CLASSIC_BUTTON.callback_data),
