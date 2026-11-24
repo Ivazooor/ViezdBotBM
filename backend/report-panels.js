@@ -239,7 +239,7 @@ function fitReportPanel(panel, page) {
   return pages[page] === undefined ? null : detailPage(panel, page, pages[page].trim(), pages.length);
 }
 
-export function createReportPanels({ tg, fallback, warn }) {
+export function createReportPanels({ tg, fallback, warn, recover }) {
   const sendClassic = (chatId, panel) => fallback(
     chatId, panel.title, panel.fallbackDetails || panel.details, panel.fallbackRows || panel.rows,
   );
@@ -271,20 +271,14 @@ export function createReportPanels({ tg, fallback, warn }) {
         const id = widget.messageId;
         await request("editMessageWidgetData", { chat_id: chatId, message_id: id, chat_data: chatData });
         session.reportWidget = { ...widget, ...current };
-        if (panel.widgetRows?.length) {
+        if (panel.widgetRows?.length || widget.hasPanelButtons || !widget.hasKeyboard) {
           try {
-            await markup(chatId, id, [...panel.widgetRows, [CLASSIC_BUTTON]]);
+            await markup(chatId, id, [...(panel.widgetRows || []), [CLASSIC_BUTTON]]);
           } catch (error) {
             if (!/message is not modified/i.test(error.message)) throw error;
           }
           session.reportWidget.hasKeyboard = true;
-        } else if (widget.hasKeyboard) {
-          try {
-            await markup(chatId, id, []);
-            session.reportWidget.hasKeyboard = false;
-          } catch {
-            // The new screen is already available even if Telegram left a native button below.
-          }
+          session.reportWidget.hasPanelButtons = Boolean(panel.widgetRows?.length);
         }
         return;
       }
@@ -299,7 +293,8 @@ export function createReportPanels({ tg, fallback, warn }) {
         session.classicReport = true;
         return legacy();
       }
-      session.reportWidget = { ...current, messageId: message.message_id, hasKeyboard: true };
+      session.reportWidget = { ...current, messageId: message.message_id, hasKeyboard: true,
+        hasPanelButtons: Boolean(panel.widgetRows?.length) };
       return message;
     } catch {
       warn("Виджет отчёта недоступен, отправлено обычное меню.");
@@ -311,15 +306,17 @@ export function createReportPanels({ tg, fallback, warn }) {
     const match = QUERY.exec(query.data || "");
     const widget = session?.reportWidget;
     const action = match && widget?.actions[Number(match[2])];
-    const valid = allowed && action && query.type?.type === "data"
-      && query.chat?.type === "private" && query.chat.id === query.from?.id
-      && query.message_id === widget.messageId && match[1] === widget.nonce
-      && session.step === widget.step && !session.submitting;
+    const ownChat = allowed && query.type?.type === "data" && query.chat?.type === "private"
+      && query.chat.id === query.from?.id && query.chat.id > 0;
+    const valid = ownChat && action && query.message_id === widget.messageId
+      && match[1] === widget.nonce && session.step === widget.step && !session.submitting;
+    const reopen = Boolean(!valid && recover && ownChat && match && (!session || session.step === "idle"));
     const code = valid ? action.callback_data || "" : "";
-    let answer = valid ? "" : "Откройте последнее сообщение бота.";
+    let answer = valid ? "" : reopen ? "Открываю обычное меню." : "Откройте последнее сообщение бота.";
     if (code === "attach_help") answer = "Нажмите скрепку рядом с полем сообщения Telegram и выберите фото или видео.";
     if (valid && code && !["attach_help", "bmcards"].includes(code)) widget.actions = [];
     await request("answerWidgetQuery", { widget_query_id: query.id, data: answer }).catch(() => {});
+    if (reopen) await recover(query.chat.id);
     if (!valid || code === "attach_help") return null;
     if (code.startsWith("panel_page:")) {
       await send(query.chat.id, session, session.reportFallback.panel, Number(code.slice(11)));
@@ -332,8 +329,9 @@ export function createReportPanels({ tg, fallback, warn }) {
     const widget = session.reportWidget;
     if (!widget) return false;
     try {
-      await markup(chatId, widget.messageId, [[button]]);
+      await markup(chatId, widget.messageId, [[button], [CLASSIC_BUTTON]]);
       widget.hasKeyboard = true;
+      widget.hasPanelButtons = true;
       return true;
     } catch {
       return false;
@@ -341,10 +339,10 @@ export function createReportPanels({ tg, fallback, warn }) {
   }
 
   async function resumeClassic(chatId, session) {
-    session.classicReport = true;
-    delete session.reportWidget;
     if (session.reportFallback?.step !== session.step) return false;
     await sendClassic(chatId, session.reportFallback.panel);
+    session.classicReport = true;
+    delete session.reportWidget;
     return true;
   }
 

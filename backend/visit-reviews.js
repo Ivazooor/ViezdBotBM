@@ -163,6 +163,14 @@ export function createVisitReviews({ tg, api, chatId, botId, senderName, htmlEsc
 
   return { prepare, deliver, handleCallback, handleReason, mention,
     authorize(reportId, userId) { return request("read", { reportId, telegramUser: String(userId) }); },
-    async reviewer(tripId) { return (await request("reviewer", { tripId })).reviewer; },
+    async reviewer(tripId, userId) {
+      const telegramUser = String(userId);
+      const { reviewer, authorized } = await request("reviewer", { tripId, telegramUser });
+      // Сервер до обновления возвращает только проверяющего.
+      if (authorized !== true && !reviewer.ids.includes(telegramUser)) {
+        throw Object.assign(new Error("Отметки может поставить только назначенный проверяющий."), { status: 403 });
+      }
+      return reviewer;
+    },
   };
 }

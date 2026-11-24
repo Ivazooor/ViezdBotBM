@@ -220,6 +220,7 @@ function sendPanel(chatId, title, details, rows) {
 
 const reportPanels = createReportPanels({
   tg,
+  recover(chatId) { return startReport(chatId, chatId, true); },
   async fallback(chatId, title, details, rows) {
     let text = details.filter(Boolean).join("\n");
     while (text.length > 3800) {
@@ -940,7 +941,7 @@ async function beginReportDate(chatId, session) {
 }
 
 // ===== Старт нового отчёта =====
-async function startReport(chatId, userId, classicReport = false) {
+async function startReport(chatId, userId, classicReport = false, reportType = null) {
   const session = resetSession(userId);
   session.classicReport = classicReport;
 
@@ -954,6 +955,7 @@ async function startReport(chatId, userId, classicReport = false) {
     }
     if (!session.profileFio) {
       session.step = "register_fio";
+      if (reportType) session.pendingReportType = reportType;
       await sendMessage(
         chatId,
         "Здравствуйте! Это первый вход. Напишите, пожалуйста, ваше ФИО — оно будет автоматически подставляться в отчёты (вводить каждый раз не нужно):"
@@ -962,8 +964,11 @@ async function startReport(chatId, userId, classicReport = false) {
     }
   }
 
-  session.step = "type";
-  await sendTypeMenu(chatId, session);
+  if (reportType) {
+    session.data.reportType = reportType;
+    return offerTripChoice(chatId, session);
+  }
+  return showTypeMenu(chatId, session);
 }
 
 // Меню выбора типа отчёта (после старта/регистрации).
@@ -1731,6 +1736,10 @@ async function handleMessage(message) {
     }
     return;
   }
+  const startReportType = /^\/start(?:@[A-Za-z0-9_]+)? report_(pre|final)$/.exec(text);
+  if (startReportType) {
+    return handleReportAction(chatId, userId, getSession(userId), "type_" + startReportType[1], message.from);
+  }
   if (text === "/start" || text === "/new") {
     await startReport(chatId, userId);
     return;
@@ -1849,6 +1858,11 @@ async function handleMessage(message) {
       await sendMessage(chatId, fioSaved
         ? `Спасибо, ${fio}! Профиль сохранён.`
         : `Принято: ${fio}. Сохранить профиль в приложении сейчас не удалось — использую имя в этой сессии.`);
+      if (session.pendingReportType) {
+        session.data.reportType = session.pendingReportType;
+        delete session.pendingReportType;
+        return offerTripChoice(chatId, session);
+      }
       return showTypeMenu(chatId, session);
     }
 
@@ -1975,12 +1989,7 @@ async function maybeHandleBadReason(message) {
   }
   const reason = text.slice(0, 2000);
   try {
-    const reviewer = await visitReviews.reviewer(p.tripId);
-    if (!reviewer.ids.includes(String(p.reviewerId))) {
-      chatMap.delete(p.reviewerId);
-      await sendMessage(message.chat.id, "Право проверки перешло к другому сотруднику.").catch(() => {});
-      return true;
-    }
+    await visitReviews.reviewer(p.tripId, p.reviewerId);
     if (p.kind === "board") {
       await bmApi("POST", { op: "set_board", tripId: p.tripId, status: "bad", reason, by: p.reviewerName });
     } else {
@@ -2015,17 +2024,15 @@ async function legacyVisitReviewer(callback, tripId) {
     await tg("answerCallbackQuery", { callback_query_id: callback.id, text: "Проверка доступна в чате фотоотчётов.", show_alert: true });
     return null;
   }
-  let text = "Отметки может поставить только назначенный проверяющий.";
   try {
-    const reviewer = await visitReviews.reviewer(tripId);
-    if (reviewer.ids.includes(String(callback.from.id))) return reviewer;
+    return await visitReviews.reviewer(tripId, callback.from.id);
   } catch (error) {
     logEvent("warn", "Проверяющий выезда:", error.message);
-    text = [404, 409].includes(error.status) ? error.message
+    const text = [403, 404, 409].includes(error.status) ? error.message
       : "Не удалось определить проверяющего. Попробуйте ещё раз.";
+    await tg("answerCallbackQuery", { callback_query_id: callback.id, text, show_alert: true });
+    return null;
   }
-  await tg("answerCallbackQuery", { callback_query_id: callback.id, text, show_alert: true });
-  return null;
 }
 
 async function handleQualityVote(callback) {
@@ -2207,16 +2214,23 @@ async function handleCallback(callback) {
     return;
   }
 
+  const reportType = data === "type_pre" || data === "type_final";
   if (callback.message.chat.type !== "private" || chatId !== userId) {
+    if (reportType && String(chatId) === TARGET_CHAT_ID) {
+      return tg("answerCallbackQuery", { callback_query_id: callback.id,
+        url: "https://t.me/" + BOT_USERNAME + "?start=report_" + data.slice(5) });
+    }
     return tg("answerCallbackQuery", { callback_query_id: callback.id, text: "Отчёты оформляются в личном чате." });
   }
   const session = getSession(userId);
-  if (data === "report_classic") {
-    const same = session.reportWidget?.messageId === callback.message.message_id;
-    await tg("answerCallbackQuery", { callback_query_id: callback.id,
-      ...(same ? {} : { text: "Откройте последнее сообщение бота." }) });
-    if (same) return resumeReportClassic(chatId, session);
-    return;
+  if (reportType || data === "report_classic") {
+    // Просроченный или потерянный ответ Telegram не должен останавливать форму.
+    void tg("answerCallbackQuery", { callback_query_id: callback.id }, 3000, false, { remainingMs: 0 })
+      .catch(error => logEvent("warn", "Подтверждение кнопки отчёта:", error.message));
+    if (reportType) return handleReportAction(chatId, userId, session, data, callback.from);
+    if (session.step === "idle") return startReport(chatId, userId, true);
+    if (!session.submitting && await resumeReportClassic(chatId, session)) return;
+    return sendMessage(chatId, "Продолжите в последнем сообщении бота.");
   }
   const separateMenu = /^(?:view_|sum_|summary_menu$|back_start$)/.test(data);
   if (!separateMenu && session.reportWidget?.step === session.step &&
@@ -2281,8 +2295,16 @@ async function handleReportAction(chatId, userId, session, data, from) {
   }
 
   if (data === "type_pre" || data === "type_final") {
-    if (session.step !== "type") return;
-    session.data.reportType = data === "type_final" ? "final" : "pre";
+    const reportType = data === "type_final" ? "final" : "pre";
+    if (session.step === "idle") return startReport(chatId, userId, true, reportType);
+    if (session.step === "register_fio" && !session.data.reportType) {
+      session.pendingReportType = reportType;
+      return sendMessage(chatId, "Напишите ваше ФИО, чтобы продолжить оформление отчёта.");
+    }
+    if (session.step !== "type") {
+      return sendMessage(chatId, "Отчёт уже открыт. Продолжите в последнем сообщении бота.");
+    }
+    session.data.reportType = reportType;
     // Вторым действием — выбор выезда из отдела «Выезды».
     await offerTripChoice(chatId, session);
     return;

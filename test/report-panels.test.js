@@ -18,7 +18,7 @@ const panel = {
 };
 const nonce = "0123456789abcdef";
 
-function setup() {
+function setup(recover) {
   const calls = [];
   const classic = [];
   const panels = createReportPanels({
@@ -28,6 +28,7 @@ function setup() {
       return true;
     },
     fallback(...args) { classic.push(args); },
+    recover,
     warn() {},
   });
   return { calls, classic, panels };
@@ -141,4 +142,51 @@ test("a failed edit offers the current actions in the standard chat", async () =
   await panels.send(13, session, { ...panel, title: "Следующий шаг" });
   assert.equal(session.classicReport, true);
   assert.deepEqual(native[0], [13, "Следующий шаг", panel.details, panel.rows]);
+});
+
+test("a stale private report widget opens an ordinary menu after a restart", async () => {
+  const recovered = [];
+  const { panels, calls } = setup(id => { recovered.push(id); });
+  const session = { step: "type" };
+  await panels.send(13, session, panel);
+  const old = query(session);
+  assert.equal(await panels.receive(old, undefined, true), null);
+  assert.deepEqual(recovered, [13]);
+  assert.equal(calls.at(-1).params.data, "Открываю обычное меню.");
+  await panels.receive(old, undefined, false);
+  await panels.receive({ ...old, chat: { id: 16, type: "private" } }, undefined, true);
+  await panels.receive(old, { step: "media", media: [{}] }, true);
+  assert.deepEqual(recovered, [13]);
+});
+
+test("the ordinary menu button remains available when the report widget changes steps", async () => {
+  const { panels, calls } = setup();
+  const session = { step: "type" };
+  const widgetRows = [[{ text: "Приложение", url: "https://example.invalid" }]];
+  await panels.send(13, session, { ...panel, widgetRows });
+  session.step = "checklist";
+  await panels.send(13, session, panel);
+  assert.deepEqual(calls.at(-1).params.reply_markup.inline_keyboard,
+    [[{ text: "Обычное меню", callback_data: "report_classic" }]]);
+});
+
+test("the current widget can start a new report without stale-menu recovery", async () => {
+  const recovered = [];
+  const { panels } = setup(id => { recovered.push(id); });
+  const session = { step: "idle" };
+  await panels.send(13, session, { ...panel, rows: [[{ text: "Новый отчёт", callback_data: "back_start" }]] });
+  const action = await panels.receive(query(session), session, true);
+  assert.equal(action.callback_data, "back_start");
+  assert.deepEqual(recovered, []);
+});
+
+test("a stale fallback does not remove the active widget", async () => {
+  const { panels } = setup();
+  const session = { step: "date" };
+  await panels.send(13, session, panel);
+  session.step = "media";
+  const active = session.reportWidget;
+  assert.equal(await panels.resumeClassic(13, session), false);
+  assert.equal(session.reportWidget, active);
+  assert.equal(session.classicReport, undefined);
 });

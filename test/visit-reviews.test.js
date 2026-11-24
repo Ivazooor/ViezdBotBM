@@ -101,3 +101,13 @@ test("the fallback tag uses Taras's Telegram account without a public username",
   await reviews.deliver(await reviews.prepare({ reportId: "m500", tripName: "Выезд" }));
   assert.match(telegram[0].input.text, /href="tg:\/\/user\?id=333333333">@Резервный<\/a>/);
 });
+
+test("legacy buttons use the authorization returned for the actual Telegram sender", async () => {
+  const { reviews, requests } = fixture(() => ({ reviewer, authorized: true }));
+  assert.equal(await reviews.reviewer("trip1", 333444555), reviewer);
+  assert.deepEqual(requests[0], {
+    op: "visit_review", chatId, action: "reviewer", tripId: "trip1", telegramUser: "333444555",
+  });
+  const older = fixture(() => ({ reviewer })).reviews;
+  await assert.rejects(older.reviewer("trip1", 333444555), { status: 403 });
+});
