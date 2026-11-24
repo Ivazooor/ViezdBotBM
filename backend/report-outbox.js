@@ -65,7 +65,7 @@ export class ReportOutbox {
   }
 
   reportEntries() { return Object.entries(this.state.reports); }
-  queueReport(id, payload, staged = false) {
+  queueReport(id, payload, staged = false, review = null) {
     this.update((s) => {
       const old = s.reports[id];
       if (old && !old.staged && JSON.stringify(old.payload) !== JSON.stringify(payload)) {
@@ -78,9 +78,25 @@ export class ReportOutbox {
         old.staged = staged;
         old.retryAt = 0;
       } else if (!old) {
-        s.reports[id] = { payload, staged, retryAt: 0, attempts: 0 };
+        s.reports[id] = { payload, staged, retryAt: 0, attempts: 0, ...(review && { review }) };
       }
     });
+  }
+  reportEntry(id) { return this.state.reports[id]; }
+  hasEarlierFinalIndex(id, tripId) {
+    if (!tripId) return false;
+    return this.reportEntries().some(([otherId, entry]) => entry.review && !entry.indexed &&
+      entry.payload.tripId === tripId && Number(otherId.slice(1)) < Number(id.slice(1)));
+  }
+  recordFinalIndex(id, result) {
+    this.update(s => {
+      const entry = s.reports[id];
+      entry.indexed = true;
+      if (result.id) entry.review.tripId = result.id;
+    });
+  }
+  setReviewDelivery(id, status) {
+    this.update(s => { s.reports[id].reviewDelivery = status; });
   }
   removeReport(id) { this.update((s) => { delete s.reports[id]; }); }
   deferReport(id) {

@@ -12,6 +12,7 @@ import { buildVisitPdf } from "./pdf.js";
 import { createTripCards } from "./trip-cards.js";
 import { createReportPanels, isReportWidgetQuery, reportWidgetFits } from "./report-panels.js";
 import { changeTaskPicker, newTaskPicker, taskCallback, taskPickerPanel, taskPickerText } from "./trip-task-picker.js";
+import { createVisitReviews } from "./visit-reviews.js";
 
 dotenv.config();
 
@@ -35,12 +36,12 @@ const EXTRA_ALLOWED_IDS =
 const ALLOWED_USER_IDS = [
   ...new Set([...parseIds(process.env.ALLOWED_USER_IDS), ...parseIds(EXTRA_ALLOWED_IDS)]),
 ];
-// Кто может оценивать качество выезда кнопками в рабочем чате.
-// Базовый список можно переопределить через .env; передачу прав ниже сохраняем обязательно.
+// Дополнительный список сотрудников с доступом к личным функциям бота.
+// Право оценки в рабочей группе определяется куратором проекта.
 const DEFAULT_REVIEWER_IDS =
   "814705792,165912761,163743492,1090755229,1504488231,898159043,466665113,758274157,97782197,369094962";
-// Передача права оценки действует и при старом списке QUALITY_REVIEWER_IDS на сервере.
-const QUALITY_REVIEWER_IDS = [
+// Сохраняем совместимость с существующей настройкой QUALITY_REVIEWER_IDS.
+const REVIEWER_BOT_ACCESS_IDS = [
   ...new Set([...parseIds(process.env.QUALITY_REVIEWER_IDS || DEFAULT_REVIEWER_IDS), "898159043"]),
 ].filter((id) => id !== "508570326");
 const PORT = Number(process.env.PORT) || 3000;
@@ -88,15 +89,6 @@ const MINIAPP_WEB_URL = (() => {
   return null;
 })();
 const MINIAPP_OK = Boolean(MINIAPP_WEB_URL);
-// Кого упоминать в вопросе «выезд выполнен?» (ответственный за финальный статус).
-const STATUS_MENTION = (process.env.STATUS_MENTION || "@matiyver").trim();
-// Кого тегать отдельным сообщением при заключительном отчёте (для уведомления).
-// Руководителя упоминаем по ID, второго адресата — по его актуальному username.
-const NOTIFY_FINAL = [
-  { id: "1504488231", name: "Руководитель" },
-  { username: "murraserebra" },
-];
-
 // ===== Тексты чек-листов (как в прежнем приложении) =====
 const CHECKLISTS = {
   pre: [
@@ -145,11 +137,7 @@ function getSession(userId) {
 function isAllowed(userId) {
   const id = String(userId);
   // Оценщикам качества доступ к боту открыт автоматически.
-  return ALLOWED_USER_IDS.includes(id) || QUALITY_REVIEWER_IDS.includes(id);
-}
-
-function isReviewer(userId) {
-  return QUALITY_REVIEWER_IDS.includes(String(userId));
+  return ALLOWED_USER_IDS.includes(id) || REVIEWER_BOT_ACCESS_IDS.includes(id);
 }
 
 function senderName(from) {
@@ -186,7 +174,9 @@ async function tg(method, params = {}, timeoutMs = 65000, retryNetwork = true, f
         continue;
       }
       // Прочие ошибки API (400/403 и т.п.) — повторять бессмысленно.
-      throw new Error(`${method}: ${data.description || response.status}`);
+      const failure = new Error(`${method}: ${data.description || response.status}`);
+      if (!retryNetwork && (response.status >= 500 || Number(data.error_code) >= 500)) failure.uncertain = true;
+      throw failure;
     } catch (error) {
       lastErr = error;
       // Ошибка API (а не сети) — пробрасываем сразу.
@@ -514,10 +504,96 @@ async function postReportWithOutbox(primary, fallback = null) {
   }
 }
 
+const finalReportsInFlight = new Set();
+
+async function syncFinalReport(id, { recover = false } = {}) {
+  if (finalReportsInFlight.has(id)) return;
+  finalReportsInFlight.add(id);
+  try {
+    let entry = reportOutbox.reportEntry(id);
+    if (!entry?.review) return;
+    if (!entry.indexed) {
+      if (reportOutbox.hasEarlierFinalIndex(id, entry.payload.tripId)) {
+        throw new Error("Сначала нужно сохранить предыдущий отчёт этого выезда");
+      }
+      await assertReportApiCompatible();
+      const indexed = await bmApi("POST", entry.payload);
+      reportOutbox.recordFinalIndex(id, indexed);
+      entry = reportOutbox.reportEntry(id);
+    }
+    if (entry.reviewDelivery === "sending" && !recover) {
+      await setReviewRecoveryButton(id, true);
+      reportOutbox.setReviewDelivery(id, "recovery");
+      return;
+    }
+    if (entry.reviewDelivery === "recovery" && !recover) return;
+    const prepared = await visitReviews.prepare(entry.review);
+    reportOutbox.setReviewDelivery(id, "sending");
+    try {
+      const sent = await visitReviews.deliver(prepared);
+      if (!Number.isSafeInteger(sent?.message_id) || sent.message_id < 1) {
+        throw Object.assign(new Error("Telegram не подтвердил ID сообщения проверки"), { uncertain: true });
+      }
+    } catch (error) {
+      if (!error.uncertain) reportOutbox.setReviewDelivery(id, recover ? "recovery" : "pending");
+      throw error;
+    }
+    if (recover) await setReviewRecoveryButton(id, false).catch(() => {});
+    reportOutbox.removeReport(id);
+  } finally {
+    finalReportsInFlight.delete(id);
+  }
+}
+
+async function setReviewRecoveryButton(id, visible) {
+  try {
+    await tg("editMessageReplyMarkup", {
+      chat_id: TARGET_CHAT_ID, message_id: Number(id.slice(1)),
+      reply_markup: { inline_keyboard: visible
+        ? [[{ text: "Восстановить сообщение проверки", callback_data: "vrr:" + id }]] : [] },
+    });
+  } catch (error) {
+    if (!/message is not modified/i.test(error.message)) throw error;
+  }
+}
+
+async function acknowledgeReviewSeen(id) {
+  const state = reportOutbox.reportEntry(id)?.reviewDelivery;
+  if (!["sending", "recovery"].includes(state) || finalReportsInFlight.has(id)) return;
+  finalReportsInFlight.add(id);
+  try {
+    if (state === "recovery") await setReviewRecoveryButton(id, false).catch(() => {});
+    reportOutbox.removeReport(id);
+  } catch (error) {
+    logEvent("error", "Квитанция сообщения проверки:", error.message);
+  } finally {
+    finalReportsInFlight.delete(id);
+  }
+}
+
+async function handleReviewRecovery(callback, id) {
+  const msg = callback.message;
+  let text = "Эта проверка уже доступна в чате.";
+  try {
+    if (String(msg.chat.id) !== TARGET_CHAT_ID || msg.message_id !== Number(id.slice(1))) return;
+    await visitReviews.authorize(id, callback.from.id);
+    const entry = reportOutbox.reportEntry(id);
+    if (entry?.reviewDelivery === "recovery") {
+      await syncFinalReport(id, { recover: true });
+      text = "Сообщение проверки восстановлено.";
+    }
+  } catch (error) {
+    logEvent("warn", "Восстановление проверки:", error.message);
+    text = error.status === 403 ? error.message : "Проверка временно недоступна. Попробуйте ещё раз.";
+  }
+  await tg("answerCallbackQuery", { callback_query_id: callback.id, text, show_alert: true });
+}
+
 async function flushReportIndex(maxItems = 3) {
   if (!bmEnabled()) return;
   const due = reportOutbox.reportEntries()
-    .filter(([, entry]) => !entry.staged && (entry.retryAt || 0) <= Date.now())
+    .filter(([id, entry]) => !entry.staged && entry.reviewDelivery !== "recovery"
+      && !finalReportsInFlight.has(id) && (entry.retryAt || 0) <= Date.now())
     .slice(0, maxItems);
   if (due.length) {
     try { await assertReportApiCompatible(); }
@@ -529,8 +605,11 @@ async function flushReportIndex(maxItems = 3) {
   }
   for (const [id, entry] of due) {
     try {
-      await bmApi("POST", entry.payload);
-      reportOutbox.removeReport(id);
+      if (entry.review) await syncFinalReport(id);
+      else {
+        await bmApi("POST", entry.payload);
+        reportOutbox.removeReport(id);
+      }
       logEvent("info", `report_index ${id}: восстановлен в KPI`);
     } catch (error) {
       reportOutbox.deferReport(id);
@@ -605,6 +684,12 @@ async function bmWaitApi(payload) {
   }
   throw lastError;
 }
+const visitReviews = createVisitReviews({
+  tg, api: bmWaitApi, chatId: TARGET_CHAT_ID, botId: TELEGRAM_BOT_TOKEN.split(":", 1)[0],
+  senderName, htmlEscape, onSeen: acknowledgeReviewSeen,
+  warn: message => logEvent("warn", message),
+});
+
 async function pollWaitingJobs() {
   if (waitingPolling || !bmEnabled()) return;
   waitingPolling = true;
@@ -767,13 +852,6 @@ const mediaKeyboard = {
   inline_keyboard: [
     [{ text: "Отправить отчёт", callback_data: "send_report", style: "primary" }],
     [{ text: "❌ Отменить", callback_data: "cancel" }],
-  ],
-};
-// Кнопки оценки качества выезда (в рабочем чате; нажимают только оценщики).
-const qualityKeyboard = {
-  inline_keyboard: [
-    [{ text: "✅ Выезд качественный", callback_data: "quality_ok" }],
-    [{ text: "⚠️ Выезд не качественный", callback_data: "quality_bad" }],
   ],
 };
 const confirmKeyboard = {
@@ -1339,20 +1417,24 @@ async function submitReport(chatId, userId, from) {
     `Файлов: ${total}\n` +
     `Отправил: ${senderName(from)}`;
 
-  // Заголовок в рабочий чат. Если упало — бот не в группе / нет прав: сообщаем и даём повторить.
-  let headerMessageId;
-  try {
-    const headerMessage = await sendMessage(TARGET_CHAT_ID, header);
-    headerMessageId = Number(headerMessage && headerMessage.message_id);
-    if (!Number.isSafeInteger(headerMessageId) || headerMessageId <= 0) {
-      throw new Error("Telegram не вернул ID заголовка отчёта");
+  // При повторе используем уже опубликованный заголовок и ID успешно скопированных файлов.
+  let delivery = session.reportDelivery;
+  if (!delivery) {
+    try {
+      const headerMessage = await sendMessage(TARGET_CHAT_ID, header);
+      const headerMessageId = Number(headerMessage && headerMessage.message_id);
+      if (!Number.isSafeInteger(headerMessageId) || headerMessageId <= 0) {
+        throw new Error("Telegram не вернул ID заголовка отчёта");
+      }
+      delivery = session.reportDelivery = { headerMessageId, copied: new Map() };
+    } catch (error) {
+      logEvent("error", "target header error:", error.message);
+      session.submitting = false;
+      return showReportStep(chatId, session, "Не удалось отправить в рабочий чат",
+        ["Данные сохранены. Проверьте доступ бота к чату и повторите отправку."], confirmKeyboard, 3);
     }
-  } catch (error) {
-    logEvent("error", "target header error:", error.message);
-    session.submitting = false;
-    return showReportStep(chatId, session, "Не удалось отправить в рабочий чат",
-      ["Данные сохранены. Проверьте доступ бота к чату и повторите отправку."], confirmKeyboard, 3);
   }
+  const { headerMessageId } = delivery;
 
   const progress = session.reportWidget
     ? showReportStep(chatId, session, "Отправляю отчёт", ["Пересылаю вложения в рабочий чат."], null, 3)
@@ -1365,36 +1447,39 @@ async function submitReport(chatId, userId, from) {
   // Пауза между файлами + автоповтор 429 в tg() — чтобы не терять файлы из-за лимита Telegram.
   const total0 = session.media.length;
   logEvent("info", `Пересылка ${total0} файлов в рабочий чат (отправитель: ${senderName(from)})`);
-  let sent = 0;
-  let failed = 0;
   const mediaMessageIds = [];
-  for (let i = 0; i < session.media.length; i++) {
-    const item = session.media[i];
-    try {
-      const copied = await tg("copyMessage", {
-        chat_id: TARGET_CHAT_ID,
-        from_chat_id: item.chatId,
-        message_id: item.messageId,
-      });
-      const copiedId = Number(copied && copied.message_id);
-      if (!Number.isSafeInteger(copiedId) || copiedId <= 0) {
-        throw new Error("Telegram не вернул ID скопированного файла");
+  for (const [i, item] of session.media.entries()) {
+    const sourceId = item.chatId + ":" + item.messageId;
+    if (!delivery.copied.has(sourceId)) {
+      try {
+        const copied = await tg("copyMessage", {
+          chat_id: TARGET_CHAT_ID,
+          from_chat_id: item.chatId,
+          message_id: item.messageId,
+        });
+        const copiedId = Number(copied && copied.message_id);
+        if (!Number.isSafeInteger(copiedId) || copiedId <= 0) {
+          throw new Error("Telegram не вернул ID скопированного файла");
+        }
+        delivery.copied.set(sourceId, copiedId);
+      } catch (error) {
+        logEvent("error", `copyMessage #${i + 1}/${total0} не удалось: ${error.message}`);
       }
-      mediaMessageIds.push(copiedId);
-      sent += 1;
-    } catch (error) {
-      failed += 1;
-      logEvent("error", `copyMessage #${i + 1}/${total0} не удалось: ${error.message}`);
+      // Telegram ограничивает скорость пересылки в группу.
+      await sleep(400);
     }
-    // Throttle: пауза между отправками снижает риск упереться в лимит группы.
-    await sleep(400);
+    const copiedId = delivery.copied.get(sourceId);
+    if (copiedId) mediaMessageIds.push(copiedId);
   }
-  logEvent("info", `Переслано ${sent}/${total0}, ошибок ${failed}`);
+  const sent = mediaMessageIds.length;
+  logEvent("info", `Переслано ${sent}/${total0} (отправитель: ${senderName(from)})`);
 
-  if (sent === 0) {
+  if (sent < total0) {
     session.submitting = false;
-    return showReportStep(chatId, session, "Файлы не дошли до рабочего чата",
-      ["Отчёт сохранён в черновике. Повторите отправку или добавьте файлы."], confirmKeyboard, 3);
+    return showReportStep(chatId, session, "Не все вложения дошли до рабочего чата",
+      [`Переслано ${sent} из ${total0}. Повторите отправку — бот перешлёт оставшиеся файлы.`],
+      { inline_keyboard: [[{ text: "Повторить отправку", callback_data: "confirm_send", style: "primary" }],
+        [{ text: "Отменить отчёт", callback_data: "cancel" }]] }, 3);
   }
 
   const report = {
@@ -1412,23 +1497,32 @@ async function submitReport(chatId, userId, from) {
   // PDF может строиться долго. Уже скопированные в рабочий чат медиа фиксируем
   // до его создания; при перезапуске отчёт восстановится хотя бы без PDF.
   let stagedPayload = null;
+  let review = null;
   if (d.reportType === "final") {
+    const details = {
+      workDone: d.workDone, workNotDone: d.workNotDone, recommendations: d.recommendations,
+      by: senderName(from), report,
+    };
     stagedPayload = d.tripCreate ? {
       op: "create", kind: "final", name: d.tripName || d.projectName,
-      date: d.visitDate, comment: d.tripTasks || "", workDone: d.workDone,
-      workNotDone: d.workNotDone, recommendations: d.recommendations,
-      by: senderName(from), report,
-    } : { op: "attach_report", tripId: d.tripId, report };
+      date: d.visitDate, comment: d.tripTasks || "", ...details,
+    } : { op: "final_report", tripId: d.tripId, ...details };
+    review = {
+      reportId: report.id, tripId: d.tripId || null, expectsTrip: true,
+      tripName: d.tripName || d.projectName,
+      projectName: d.linkedProjectName || (!d.tripId ? d.projectName : ""),
+      date: d.visitDate, employee: d.responsible,
+    };
     try {
-      reportOutbox.queueReport(report.id, stagedPayload, true);
+      reportOutbox.queueReport(report.id, stagedPayload, true, review);
     } catch (error) {
-      logEvent("error", `report_index ${report.id}: не удалось подготовить дисковую очередь: ${error.message}`);
+      logEvent("error", "Не удалось подготовить сохранение заключительного отчёта:", error.message);
     }
   }
 
   let indexNote = "";
   async function showIndexResult(text) {
-    if (session.reportWidget) indexNote = text;
+    if (session.reportWidget) indexNote = [indexNote, text].filter(Boolean).join("\n\n");
     else await sendMessage(chatId, text).catch(() => {});
   }
 
@@ -1543,7 +1637,7 @@ async function submitReport(chatId, userId, from) {
         report.pdfMessageId = pdfId;
         // Личная отправка PDF может длиться долго. Фиксируем ID файла из рабочего
         // чата сразу, чтобы рестарт не восстановил только фото и видео.
-        try { reportOutbox.queueReport(report.id, stagedPayload, true); }
+        try { reportOutbox.queueReport(report.id, stagedPayload, true, review); }
         catch (error) { logEvent("error", `report_index ${report.id}: не удалось сохранить PDF ID: ${error.message}`); }
       }
       try {
@@ -1560,103 +1654,23 @@ async function submitReport(chatId, userId, from) {
 
     report.sentAt = new Date().toISOString();
 
-    // Запись результата в карточку выезда KPI-приложения (если интеграция включена).
-    let kpiTripId = d.tripId || null;
-    if (bmEnabled()) {
-      try {
-        if (d.tripCreate) {
-          // Запасная кнопка «Создать карточку» — заводим выезд из данных бота.
-          const created = await postReportWithOutbox({
-            op: "create",
-            kind: "final",
-            name: d.tripName || d.projectName,
-            date: d.visitDate,
-            comment: d.tripTasks || "",
-            workDone: d.workDone,
-            workNotDone: d.workNotDone,
-            recommendations: d.recommendations,
-            by: senderName(from),
-            report,
-          });
-          kpiTripId = created.id || null;
-          // Новая карточка → есть только заключительный отчёт; предупреждаем, иначе «качественный» будет заблокирован.
-          await showIndexResult(
-            `✅ Создана карточка выезда «${d.tripName || d.projectName}» с отметкой «заключительный отчёт получен».\n\n` +
-            "⚠️ В этой карточке нет предварительного отчёта — «качественный» откроется только после того, как по этому же выезду поступит и предварительный отчёт."
-          );
-        } else if (kpiTripId) {
-          const finalReport = {
-            op: "final_report",
-            tripId: kpiTripId,
-            workDone: d.workDone,
-            workNotDone: d.workNotDone,
-            recommendations: d.recommendations,
-            by: senderName(from),
-            report,
-          };
-          await postReportWithOutbox(finalReport, { op: "attach_report", tripId: kpiTripId, report });
-          await showIndexResult(
-            `✅ Бот отметил в карточке выезда${d.tripName ? " «" + d.tripName + "»" : ""}: заключительный отчёт получен.`
-          );
-        } else {
-          // Выезд не выбран и карточка не создана → отмечать нечего. Сообщаем, чтобы отметку не искали зря.
-          await showIndexResult(
-            "⚠️ Выезд не был выбран из списка, поэтому отметка «заключительный отчёт получен» в карточке не проставлена.\n\n" +
-            "Отправьте заключительный отчёт ещё раз через /start и выберите выезд из списка (тот же, что и для предварительного отчёта)."
-          );
-        }
-      } catch (error) {
-        logEvent("error", "bm kpi-запись:", error.message);
-        // [B1] Не молчим: отчёт ушёл в чат, но в карточку выезда (приложение) не записался.
-        await showIndexResult(
-          "⚠️ Отчёт отправлен в рабочий чат, но запись в карточке выезда не завершена: " + error.message +
-          (error.indexAttached
-            ? "\n\nФайлы уже доступны через поиск. Проверьте отметку отчёта и тексты работ в карточке выезда."
-            : error.indexQueued
-              ? "\n\nБот сохранил запрос на повтор. Не создавайте карточку вручную, чтобы не получить дубль."
-              : "\n\nСообщите руководителю: автоматический повтор недоступен.")
-        );
+    // Та же долговечная запись хранит все поля отчёта и задачу публикации проверки.
+    // Повтор CRM идемпотентен по report.id, а неоднозначную отправку в Telegram
+    // восстанавливаем через кнопку в уже отправленном фотоотчёте.
+    try {
+      reportOutbox.queueReport(report.id, stagedPayload, false, review);
+      await syncFinalReport(report.id);
+      await showIndexResult("✅ Заключительный отчёт сохранён в карточке выезда. Проверка доступна в рабочем чате.");
+      if (d.tripCreate) await showIndexResult("Для отметки «Качественно» нужен и предварительный отчёт по этому же выезду.");
+    } catch (error) {
+      logEvent("error", "Сохранение заключительного отчёта и проверки:", error.message);
+      if (reportOutbox.reportEntry(report.id)) {
+        try { reportOutbox.deferReport(report.id); }
+        catch (queueError) { logEvent("error", "Не удалось обновить срок повтора отчёта:", queueError.message); }
+        await showIndexResult("⚠️ Фотоотчёт в чате. Бот продолжит сохранять данные и восстанавливать проверку.");
+      } else {
+        await showIndexResult("⚠️ Фотоотчёт в чате. Сообщите руководителю: очередь сохранения недоступна.");
       }
-    }
-
-    // Кнопки оценки качества выезда — в рабочий чат (нажимают только оценщики).
-    // Если выезд привязан к карточке — оценка запишется в KPI (callback несёт tripId).
-    const qk = kpiTripId
-      ? {
-          inline_keyboard: [
-            [{ text: "✅ Выезд качественный", callback_data: "quality_ok|" + kpiTripId }],
-            [{ text: "⚠️ Выезд не качественный", callback_data: "quality_bad|" + kpiTripId }],
-          ],
-        }
-      : qualityKeyboard;
-    try {
-      await sendMessage(
-        TARGET_CHAT_ID,
-        `🔎 Оценка качества выезда\n\n` +
-          `Выезд: ${d.tripName || d.projectName}\n` +
-          (d.linkedProjectName ? `Проект: ${d.linkedProjectName}\n` : "") +
-          `Дата выезда: ${d.visitDate}\n` +
-          `Выездник: ${d.responsible}`,
-        qk
-      );
-    } catch (error) {
-      logEvent("error", "quality buttons error:", error.message);
-    }
-
-    // Третье сообщение — тег ответственных для уведомления.
-    try {
-      const mentions = NOTIFY_FINAL
-        .map((u) => u.id
-          ? `<a href="tg://user?id=${u.id}">${htmlEscape(u.name)}</a>`
-          : `@${htmlEscape(u.username)}`)
-        .join(" ");
-      await tg("sendMessage", {
-        chat_id: TARGET_CHAT_ID,
-        text: `🔔 ${mentions} — поступил заключительный отчёт по выезду «${htmlEscape(d.tripName || d.projectName)}». Просьба проверить.`,
-        parse_mode: "HTML",
-      });
-    } catch (error) {
-      logEvent("error", "notify mentions error:", error.message);
     }
   }
 
@@ -1689,7 +1703,9 @@ async function handleMessage(message) {
   // [BAD-REASON] Рабочая группа: ловим причину «не качественный» от оценщика; прочие сообщения групп игнорируем.
   if (message.chat.type !== "private") {
     if (String(chatId) === String(TARGET_CHAT_ID)) {
-      try { await maybeHandleBadReason(message); } catch (error) { logEvent("error", "badReason:", error.message); }
+      try {
+        if (!await visitReviews.handleReason(message)) await maybeHandleBadReason(message);
+      } catch (error) { logEvent("error", "badReason:", error.message); }
     }
     return;
   }
@@ -1925,7 +1941,7 @@ async function requestBadReason(callback, { kind, tripId }) {
 }
 
 // [BAD-REASON] Приём причины в рабочем чате. Возвращает true, если сообщение обработано как причина.
-// [REVIEW-168] Матчинг: Reply на КОНКРЕТНЫЙ запрос → тот pending (любой автор — явный адресат);
+// [REVIEW-168] Матчинг: Reply на КОНКРЕТНЫЙ запрос от того же оценщика → тот pending;
 // без Reply → только СВОЙ pending отправителя. Reply на постороннее сообщение — НЕ причина.
 // Команды («/…») — не причина. Текст «отмена»/«-» — отменить запрос без записи оценки.
 async function maybeHandleBadReason(message) {
@@ -1945,6 +1961,7 @@ async function maybeHandleBadReason(message) {
     p = message.from ? chatMap.get(message.from.id) : null; // без reply — только свой запрос
     if (!p) return false;
   }
+  if (p.reviewerId !== message.from?.id) return false;
   const text = (message.text || "").trim();
   if (!text) {                                          // фото/стикер вместо текста
     if (isReply) await sendMessage(message.chat.id, "Пришлите причину текстом, пожалуйста.").catch(() => {});
@@ -1958,6 +1975,12 @@ async function maybeHandleBadReason(message) {
   }
   const reason = text.slice(0, 2000);
   try {
+    const reviewer = await visitReviews.reviewer(p.tripId);
+    if (!reviewer.ids.includes(String(p.reviewerId))) {
+      chatMap.delete(p.reviewerId);
+      await sendMessage(message.chat.id, "Право проверки перешло к другому сотруднику.").catch(() => {});
+      return true;
+    }
     if (p.kind === "board") {
       await bmApi("POST", { op: "set_board", tripId: p.tripId, status: "bad", reason, by: p.reviewerName });
     } else {
@@ -1986,24 +2009,31 @@ async function maybeHandleBadReason(message) {
   return true;
 }
 
-// Оценка качества выезда кнопками в рабочем чате. Реагирует только на оценщиков;
-// остальным — всплывающее уведомление, сообщение не меняется.
-async function handleQualityVote(callback) {
-  const userId = callback.from.id;
-  const msg = callback.message;
-
-  if (!isReviewer(userId)) {
-    await tg("answerCallbackQuery", {
-      callback_query_id: callback.id,
-      text: "Оценивать качество выезда может только ответственный.",
-      show_alert: true,
-    });
-    return;
+// Ранее опубликованные кнопки сохраняют свой формат, но проверяющий берётся из проекта.
+async function legacyVisitReviewer(callback, tripId) {
+  if (String(callback.message.chat.id) !== TARGET_CHAT_ID) {
+    await tg("answerCallbackQuery", { callback_query_id: callback.id, text: "Проверка доступна в чате фотоотчётов.", show_alert: true });
+    return null;
   }
+  let text = "Отметки может поставить только назначенный проверяющий.";
+  try {
+    const reviewer = await visitReviews.reviewer(tripId);
+    if (reviewer.ids.includes(String(callback.from.id))) return reviewer;
+  } catch (error) {
+    logEvent("warn", "Проверяющий выезда:", error.message);
+    text = [404, 409].includes(error.status) ? error.message
+      : "Не удалось определить проверяющего. Попробуйте ещё раз.";
+  }
+  await tg("answerCallbackQuery", { callback_query_id: callback.id, text, show_alert: true });
+  return null;
+}
 
+async function handleQualityVote(callback) {
+  const msg = callback.message;
   const good = callback.data.startsWith("quality_ok");
-  // tripId передаётся в callback после «|», если выезд был привязан к карточке.
-  const tripId = callback.data.includes("|") ? callback.data.split("|")[1] : null;
+  const tripId = callback.data.split("|")[1] || null;
+  const reviewer = await legacyVisitReviewer(callback, tripId);
+  if (!reviewer) return;
 
   // [BAD-REASON] «Не качественный» → сперва спрашиваем причину в чате; оценка запишется после её получения.
   if (!good && bmEnabled() && tripId) {
@@ -2060,38 +2090,29 @@ async function handleQualityVote(callback) {
   // После оценки — спросить у ответственного финальный статус выезда (Выполнен/Брак).
   if (bmEnabled() && tripId) {
     try {
-      await sendMessage(
-        TARGET_CHAT_ID,
-        `${STATUS_MENTION} Отмечаем что выезд выполнен?`,
-        {
+      await tg("sendMessage", {
+        chat_id: TARGET_CHAT_ID,
+        text: visitReviews.mention(reviewer) + " Отмечаем что выезд выполнен?",
+        parse_mode: "HTML",
+        reply_markup: {
           inline_keyboard: [
             [{ text: "✅ Выполнен", callback_data: "done_ok|" + tripId }],
             [{ text: "⚠️ Не выполнен", callback_data: "done_bad|" + tripId }],
           ],
-        }
-      );
+        },
+      });
     } catch (error) {
       logEvent("error", "status buttons:", error.message);
     }
   }
 }
 
-// Финальный статус выезда (кнопки «Выполнен/Не выполнен» в чате). Только оценщики.
+// Ранее опубликованные кнопки финального статуса.
 async function handleStatusVote(callback) {
-  const userId = callback.from.id;
   const msg = callback.message;
-
-  if (!isReviewer(userId)) {
-    await tg("answerCallbackQuery", {
-      callback_query_id: callback.id,
-      text: "Отмечать статус выезда может только ответственный.",
-      show_alert: true,
-    });
-    return;
-  }
-
   const done = callback.data.startsWith("done_ok");
-  const tripId = callback.data.includes("|") ? callback.data.split("|")[1] : null;
+  const tripId = callback.data.split("|")[1] || null;
+  if (!await legacyVisitReviewer(callback, tripId)) return;
 
   // [BAD-REASON] «Не выполнен» = брак → сперва причина из чата (как у кнопки «Не качественный»).
   if (!done && bmEnabled() && tripId) {
@@ -2166,6 +2187,9 @@ async function handleCallback(callback) {
     }
     return;
   }
+
+  if (/^vrr:m[1-9]\d{0,15}$/.test(data || "")) return handleReviewRecovery(callback, data.slice(4));
+  if (data?.startsWith("vr:")) return visitReviews.handleCallback(callback);
 
   // Кнопки оценки качества (в рабочем чате) — отдельная ветка со своей проверкой прав.
   // callback может нести tripId после «|» (quality_ok|<id>).

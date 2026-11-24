@@ -124,3 +124,31 @@ test("ошибки ACK откладываются и не блокируют в�
   assert.equal(ack.attempts, 1);
   assert.ok(ack.retryAt > Date.now());
 }));
+
+test("полный отчёт и известный результат публикации переживают перезапуск", () => withOutbox((file) => {
+  const id = "m42";
+  const review = { reportId: id, tripId: null, tripName: "Макет" };
+  const payload = { op: "create", kind: "final", workDone: "Установили блок", report: { id } };
+  new ReportOutbox(file).queueReport(id, payload, true, review);
+
+  const restarted = new ReportOutbox(file);
+  assert.equal(restarted.reportEntry(id).staged, false);
+  assert.deepEqual(restarted.reportEntry(id).payload, payload);
+  restarted.recordFinalIndex(id, { id: "trip1" });
+  restarted.setReviewDelivery(id, "sending");
+
+  const afterLostResponse = new ReportOutbox(file).reportEntry(id);
+  assert.equal(afterLostResponse.indexed, true);
+  assert.equal(afterLostResponse.review.tripId, "trip1");
+  assert.equal(afterLostResponse.reviewDelivery, "sending");
+}));
+
+test("более поздний отчёт не обгоняет незавершённую запись того же выезда", () => withOutbox((file) => {
+  const outbox = new ReportOutbox(file);
+  outbox.queueReport("m42", { op: "final_report", tripId: "trip1" }, true, { reportId: "m42" });
+  assert.equal(outbox.hasEarlierFinalIndex("m43", "trip1"), true);
+  assert.equal(outbox.hasEarlierFinalIndex("m43", "trip2"), false);
+  assert.equal(outbox.hasEarlierFinalIndex("m42", "trip1"), false);
+  outbox.recordFinalIndex("m42", {});
+  assert.equal(new ReportOutbox(file).hasEarlierFinalIndex("m43", "trip1"), false);
+}));
