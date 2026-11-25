@@ -152,3 +152,28 @@ test("более поздний отчёт не обгоняет незавер�
   outbox.recordFinalIndex("m42", {});
   assert.equal(new ReportOutbox(file).hasEarlierFinalIndex("m43", "trip1"), false);
 }));
+
+test("series delivery checkpoints survive restart and are handed to the CRM outbox atomically", () => withOutbox((file) => {
+  const original = new ReportOutbox(file);
+  const owner = "10001";
+  const draft = { claimId: "a".repeat(32), header: 42, copied: [["10001:6", 43]], uncertain: true };
+  original.saveSeriesDraft(owner, draft);
+  draft.copied.length = 0;
+  const restarted = new ReportOutbox(file);
+  assert.deepEqual(restarted.seriesDraft(owner).copied, [["10001:6",43]]);
+  assert.equal(restarted.seriesDraft(owner).uncertain, true);
+  const payload = { op:"preliminary", uid: owner, seriesClaimId: draft.claimId, report:{id:"m42"} };
+  restarted.queueReport("m42", payload, false, null, owner);
+  const recovered = new ReportOutbox(file);
+  assert.equal(recovered.seriesDraft(owner), undefined);
+  assert.deepEqual(recovered.reportEntry("m42").payload, payload);
+}));
+
+test("a released series claim keeps evidence and does not block a newer final report", () => withOutbox(file => {
+  const box = new ReportOutbox(file);
+  box.queueReport("m42", { op:"final_report", tripId:"trip1" }, false, { reportId:"m42" });
+  assert.equal(box.hasEarlierFinalIndex("m60", "trip1"), true);
+  box.blockReport("m42", "trip_series_claim_required");
+  assert.equal(new ReportOutbox(file).hasEarlierFinalIndex("m60", "trip1"), false);
+  assert.equal(box.reportEntry("m42").blocked, "trip_series_claim_required");
+}));

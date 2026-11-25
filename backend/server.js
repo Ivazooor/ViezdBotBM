@@ -355,8 +355,8 @@ const tripCards = process.env.BM_TRIP_CARDS === "1" ? createTripCards({
 }) : null;
 
 // Список незавершённых выездов для выбора в боте.
-async function bmGetTrips() {
-  const data = await bmApi("GET", { op: "trips" });
+async function bmGetTrips(userId, scope) {
+  const data = await bmApi("GET", { op: "trips", uid: String(userId), scope });
   return Array.isArray(data.trips) ? data.trips : [];
 }
 
@@ -464,7 +464,7 @@ async function postReportWithOutbox(primary, fallback = null) {
   const retryPayload = fallback || primary;
   let durable = false;
   try {
-    reportOutbox.queueReport(id, retryPayload);
+    reportOutbox.queueReport(id, retryPayload, false, null, primary.seriesClaimId ? primary.uid : null);
     durable = true;
   } catch (error) {
     logEvent("error", `report_index ${id}: не удалось записать дисковую очередь: ${error.message}`);
@@ -497,9 +497,10 @@ async function postReportWithOutbox(primary, fallback = null) {
         if (durable) reportOutbox.deferReport(id);
       }
     } else if (durable) {
-      reportOutbox.deferReport(id);
+      if (error.code === "trip_series_claim_required") reportOutbox.blockReport(id, error.code);
+      else reportOutbox.deferReport(id);
     }
-    error.indexQueued = durable && !error.indexAttached;
+    error.indexQueued = durable && !error.indexAttached && error.code !== "trip_series_claim_required";
     if (!durable && !error.indexAttached) error.message += " (автоматический повтор недоступен: ошибка дисковой очереди)";
     throw error;
   }
@@ -518,7 +519,13 @@ async function syncFinalReport(id, { recover = false } = {}) {
         throw new Error("Сначала нужно сохранить предыдущий отчёт этого выезда");
       }
       await assertReportApiCompatible();
-      const indexed = await bmApi("POST", entry.payload);
+      let indexed;
+      try {
+        indexed = await bmApi("POST", entry.payload);
+      } catch (error) {
+        if (error.code === "trip_series_claim_required") reportOutbox.blockReport(id, error.code);
+        throw error;
+      }
       reportOutbox.recordFinalIndex(id, indexed);
       entry = reportOutbox.reportEntry(id);
     }
@@ -593,7 +600,7 @@ async function handleReviewRecovery(callback, id) {
 async function flushReportIndex(maxItems = 3) {
   if (!bmEnabled()) return;
   const due = reportOutbox.reportEntries()
-    .filter(([id, entry]) => !entry.staged && entry.reviewDelivery !== "recovery"
+    .filter(([id, entry]) => !entry.staged && !entry.blocked && entry.reviewDelivery !== "recovery"
       && !finalReportsInFlight.has(id) && (entry.retryAt || 0) <= Date.now())
     .slice(0, maxItems);
   if (due.length) {
@@ -613,7 +620,8 @@ async function flushReportIndex(maxItems = 3) {
       }
       logEvent("info", `report_index ${id}: восстановлен в KPI`);
     } catch (error) {
-      reportOutbox.deferReport(id);
+      if (error.code === "trip_series_claim_required") reportOutbox.blockReport(id, error.code);
+      else reportOutbox.deferReport(id);
       logEvent("error", `report_index ${id}: ${error.message}`);
     }
   }
@@ -927,6 +935,7 @@ async function reportPhotoButton(chatId, session) {
 }
 
 async function beginReportDate(chatId, session) {
+  if (session.data.seriesRevision) return goAfterResponsible(chatId, session);
   session.step = "date";
   session.data.visitDate = nowMoscow();
   const details = ["Дата по Москве · " + session.data.visitDate];
@@ -941,7 +950,42 @@ async function beginReportDate(chatId, session) {
 }
 
 // ===== Старт нового отчёта =====
-async function startReport(chatId, userId, classicReport = false, reportType = null) {
+async function startReport(chatId, userId, classicReport = false, reportType = null, keepSeriesDraft = false) {
+  const owner = String(userId);
+  const draft = keepSeriesDraft ? null : reportOutbox.seriesDraft(owner);
+  if (draft) {
+    let missing = false;
+    if (draft.header || draft.uncertain) {
+      let status;
+      try {
+        status = await bmApi("POST", { op: "check_series_report", uid: owner, tripId: draft.data.tripId,
+          type: draft.data.reportType === "final" ? "final" : "prelim", seriesClaimId: draft.claimId });
+      } catch (error) {
+        logEvent("warn", "series delivery state:", error.message);
+        await sendMessage(chatId, "Не удалось проверить состояние предыдущего отчёта. Черновик сохранён.");
+        status = { pending: true, unavailable: true };
+      }
+      missing = !status.pending;
+      if (status.unavailable) draft.uncertain = true;
+    }
+    if (missing) {
+      reportOutbox.removeSeriesDraft(owner);
+    } else if (draft.uncertain) {
+      await sendMessage(chatId, "Доставку предыдущего отчёта нужно сверить с рабочим чатом. Передайте руководителю номер выезда " + draft.data.tripId + ".");
+    } else {
+      const resumed = resetSession(userId);
+      resumed.step = "confirm";
+      resumed.data = draft.data;
+      resumed.media = draft.media;
+      resumed.seriesClaimId = draft.claimId;
+      resumed.seriesSentAt = draft.sentAt;
+      if (draft.header) resumed.reportDelivery = { headerMessageId: draft.header, copied: new Map(draft.copied) };
+      return showReportStep(chatId, resumed, "Отчёт сохранён", ["Продолжите отправку оставшихся файлов."], {
+        inline_keyboard: [...confirmKeyboard.inline_keyboard.filter(row => row.every(button => button.callback_data !== "cancel")),
+          [{ text: "Другой отчёт", callback_data: "series_keep_draft" }]],
+      }, 3);
+    }
+  }
   const session = resetSession(userId);
   session.classicReport = classicReport;
 
@@ -1094,7 +1138,7 @@ async function offerTripChoice(chatId, session, page = 0, useCached = false) {
   let trips = [];
   const fromCache = useCached && Array.isArray(session.tripList);
   try {
-    trips = fromCache ? session.tripList : await bmGetTrips();
+    trips = fromCache ? session.tripList : await bmGetTrips(chatId, "report");
   } catch (error) {
     logEvent("error", "bmGetTrips:", error.message);
     // Не уводим сразу в «новый выезд»: при короткой сетевой икоте так появился бы дубль карточки
@@ -1242,7 +1286,7 @@ async function showTripsForView(chatId, session) {
   }
   let trips = [];
   try {
-    trips = await bmGetTrips();
+    trips = await bmGetTrips(chatId, "view");
   } catch (error) {
     logEvent("error", "bmGetTrips(view):", error.message);
     await sendMessage(chatId, "⚠️ Не удалось получить список выездов из приложения. Попробуйте позже.");
@@ -1264,9 +1308,10 @@ async function showTripsForView(chatId, session) {
 
 async function showTripDetails(chatId, session, tripId) {
   let t = session.viewChoices && session.viewChoices[tripId];
-  if (!t && bmEnabled()) {
+  if ((!t || t.seriesRevision) && bmEnabled()) {
+    t = null;
     try {
-      const trips = await bmGetTrips();
+      const trips = await bmGetTrips(chatId, "view");
       t = trips.find((x) => x && x.id === tripId);
     } catch (error) {
       logEvent("error", "bmGetTrips(details):", error.message);
@@ -1410,7 +1455,66 @@ async function submitReport(chatId, userId, from) {
   }
   session.submitting = true;
 
+  try {
+    return await publishReport(chatId, userId, from, session);
+  } catch (error) {
+    session.submitting = false;
+    logEvent("error", "Не удалось завершить отправку отчёта:", error.message);
+    return showReportStep(chatId, session, "Отправка прервалась",
+      ["Откройте /start, чтобы проверить сохранённый отчёт."], null, 3);
+  }
+}
+
+async function publishReport(chatId, userId, from, session) {
   const d = session.data;
+  const series = Boolean(d.seriesRevision);
+  const owner = String(userId);
+  const pending = series ? reportOutbox.seriesDraft(owner) : null;
+  if (pending && pending.claimId !== session.seriesClaimId) {
+    session.submitting = false;
+    return sendMessage(chatId, "Есть незавершённая отправка. Нажмите /start, чтобы продолжить.");
+  }
+  const seriesAuth = series ? {
+    tripId: d.tripId,
+    type: d.reportType === "final" ? "final" : "prelim",
+    uid: String(userId),
+    revision: d.seriesRevision,
+    seriesClaimId: session.seriesClaimId ||= randomBytes(16).toString("hex"),
+  } : null;
+  let seriesHeartbeat = 0;
+  async function reserveSeries() {
+    const assignment = await bmApi("POST", { op: "reserve_series_report", ...seriesAuth });
+    seriesHeartbeat = Date.now();
+    return assignment;
+  }
+  function checkpointSeries(uncertain) {
+    if (!series) return;
+    const delivery = session.reportDelivery;
+    reportOutbox.saveSeriesDraft(owner, { data: d, media: session.media, claimId: seriesAuth.seriesClaimId,
+      header: delivery?.headerMessageId || null, copied: [...(delivery?.copied || [])],
+      sentAt: session.seriesSentAt || null, uncertain });
+  }
+  if (series) {
+    if (session.seriesTelegramUnknown || pending?.uncertain) {
+      session.submitting = false;
+      return showReportStep(chatId, session, "Отправку нужно проверить",
+        ["Telegram не подтвердил доставку. Передайте руководителю номер выезда " + d.tripId + "."], null, 3);
+    }
+    try {
+      checkpointSeries(false);
+      const assignment = await reserveSeries();
+      d.visitDate = assignment.date;
+      d.responsible = assignment.responsible;
+    } catch (error) {
+      session.submitting = false;
+      if (error.code === "trip_series_assignment_changed" && !session.reportDelivery) {
+        reportOutbox.removeSeriesDraft(owner);
+        return offerTripChoice(chatId, session);
+      }
+      return showReportStep(chatId, session, "Отправка пока недоступна",
+        [error.permanent ? error.message : "Связь с приложением прервалась. Попробуйте ещё раз."], confirmKeyboard, 3);
+    }
+  }
   const total = session.media.length;
   const header =
     `${d.reportType === "final" ? "✅" : "🟦"} ${reportTypeLabel(d.reportType)} фотоотчёт\n\n` +
@@ -1426,15 +1530,30 @@ async function submitReport(chatId, userId, from) {
   let delivery = session.reportDelivery;
   if (!delivery) {
     try {
-      const headerMessage = await sendMessage(TARGET_CHAT_ID, header);
+      checkpointSeries(true);
+      const headerMessage = series
+        ? await tg("sendMessage", { chat_id: TARGET_CHAT_ID, text: header }, 65000, false, { remainingMs: 60000 })
+        : await sendMessage(TARGET_CHAT_ID, header);
       const headerMessageId = Number(headerMessage && headerMessage.message_id);
       if (!Number.isSafeInteger(headerMessageId) || headerMessageId <= 0) {
-        throw new Error("Telegram не вернул ID заголовка отчёта");
+        throw Object.assign(new Error("Telegram не вернул ID заголовка отчёта"), { uncertain: true });
       }
       delivery = session.reportDelivery = { headerMessageId, copied: new Map() };
+      checkpointSeries(false);
     } catch (error) {
       logEvent("error", "target header error:", error.message);
       session.submitting = false;
+      if (series && (error.uncertain || session.reportDelivery)) {
+        session.seriesTelegramUnknown = true;
+        return showReportStep(chatId, session, "Отправку нужно проверить",
+          ["Telegram не подтвердил доставку. Передайте руководителю номер выезда " + d.tripId + "."], null, 3);
+      }
+      if (series) {
+        checkpointSeries(false);
+        await bmApi("POST", { op: "cancel_series_report", ...seriesAuth })
+          .then(() => reportOutbox.removeSeriesDraft(owner))
+          .catch(err => logEvent("error", "Не удалось снять резерв отчёта:", err.message));
+      }
       return showReportStep(chatId, session, "Не удалось отправить в рабочий чат",
         ["Данные сохранены. Проверьте доступ бота к чату и повторите отправку."], confirmKeyboard, 3);
     }
@@ -1455,20 +1574,27 @@ async function submitReport(chatId, userId, from) {
   const mediaMessageIds = [];
   for (const [i, item] of session.media.entries()) {
     const sourceId = item.chatId + ":" + item.messageId;
-    if (!delivery.copied.has(sourceId)) {
+    if (!delivery.copied.has(sourceId) && !session.seriesTelegramUnknown) {
       try {
+        if (series && Date.now() - seriesHeartbeat > 30000) await reserveSeries();
+        checkpointSeries(true);
         const copied = await tg("copyMessage", {
           chat_id: TARGET_CHAT_ID,
           from_chat_id: item.chatId,
           message_id: item.messageId,
-        });
+        }, 65000, !series, series ? { remainingMs: 60000 } : null);
         const copiedId = Number(copied && copied.message_id);
         if (!Number.isSafeInteger(copiedId) || copiedId <= 0) {
-          throw new Error("Telegram не вернул ID скопированного файла");
+          throw Object.assign(new Error("Telegram не вернул ID скопированного файла"), { uncertain: true });
         }
         delivery.copied.set(sourceId, copiedId);
+        checkpointSeries(false);
       } catch (error) {
         logEvent("error", `copyMessage #${i + 1}/${total0} не удалось: ${error.message}`);
+        if (series) {
+          if (error.uncertain || delivery.copied.has(sourceId)) session.seriesTelegramUnknown = true;
+          else checkpointSeries(false);
+        }
       }
       // Telegram ограничивает скорость пересылки в группу.
       await sleep(400);
@@ -1481,12 +1607,20 @@ async function submitReport(chatId, userId, from) {
 
   if (sent < total0) {
     session.submitting = false;
+    if (series && session.seriesTelegramUnknown) {
+      return showReportStep(chatId, session, "Доставку вложений нужно проверить",
+        ["Telegram не подтвердил доставку всех файлов. Передайте руководителю номер выезда " + d.tripId + "."], null, 3);
+    }
     return showReportStep(chatId, session, "Не все вложения дошли до рабочего чата",
       [`Переслано ${sent} из ${total0}. Повторите отправку — бот перешлёт оставшиеся файлы.`],
       { inline_keyboard: [[{ text: "Повторить отправку", callback_data: "confirm_send", style: "primary" }],
-        [{ text: "Отменить отчёт", callback_data: "cancel" }]] }, 3);
+        ...(series ? [] : [[{ text: "Отменить отчёт", callback_data: "cancel" }]])] }, 3);
   }
 
+  if (series) {
+    session.seriesSentAt ||= new Date().toISOString();
+    checkpointSeries(false);
+  }
   const report = {
     id: "m" + headerMessageId,
     type: d.reportType === "final" ? "final" : "prelim",
@@ -1496,7 +1630,7 @@ async function submitReport(chatId, userId, from) {
     pdfMessageId: null,
     visitDate: String(d.visitDate || ""),
     projectName: String(d.linkedProjectName || ""),
-    sentAt: new Date().toISOString(),
+    sentAt: session.seriesSentAt || new Date().toISOString(),
   };
 
   // PDF может строиться долго. Уже скопированные в рабочий чат медиа фиксируем
@@ -1511,7 +1645,7 @@ async function submitReport(chatId, userId, from) {
     stagedPayload = d.tripCreate ? {
       op: "create", kind: "final", name: d.tripName || d.projectName,
       date: d.visitDate, comment: d.tripTasks || "", ...details,
-    } : { op: "final_report", tripId: d.tripId, ...details };
+    } : { op: "final_report", tripId: d.tripId, ...details, ...seriesAuth };
     review = {
       reportId: report.id, tripId: d.tripId || null, expectsTrip: true,
       tripName: d.tripName || d.projectName,
@@ -1519,9 +1653,10 @@ async function submitReport(chatId, userId, from) {
       date: d.visitDate, employee: d.responsible,
     };
     try {
-      reportOutbox.queueReport(report.id, stagedPayload, true, review);
+      reportOutbox.queueReport(report.id, stagedPayload, true, review, series ? owner : null);
     } catch (error) {
       logEvent("error", "Не удалось подготовить сохранение заключительного отчёта:", error.message);
+      if (series) throw error;
     }
   }
 
@@ -1561,8 +1696,8 @@ async function submitReport(chatId, userId, from) {
   }
   if (d.reportType !== "final" && bmEnabled() && d.tripId && !d.tripCreate) {
     try {
-      const prelim = { op: "preliminary", tripId: d.tripId, tasks: d.tripTasks || d.comment || "", by: senderName(from), report };
-      await postReportWithOutbox(prelim, { op: "attach_report", tripId: d.tripId, report });
+      const prelim = { op: "preliminary", tripId: d.tripId, tasks: d.tripTasks || d.comment || "", by: senderName(from), report, ...seriesAuth };
+      await postReportWithOutbox(prelim, series ? null : { op: "attach_report", tripId: d.tripId, report });
       logEvent("info", "Отметка предварительного отчёта поставлена, tripId=" + d.tripId);
       await showIndexResult(
         `✅ Бот отметил в карточке выезда${d.tripName ? " «" + d.tripName + "»" : ""}: предварительный отчёт получен.`
@@ -1574,7 +1709,8 @@ async function submitReport(chatId, userId, from) {
         (error.indexAttached
           ? "\n\nФайлы уже доступны через поиск. Проверьте отметку отчёта и задачи в карточке выезда."
           : error.indexQueued
-            ? "\n\nБот повторит сохранение файлов для поиска. Отметку нужно проверить в карточке выезда."
+            ? (series ? "\n\nБот повторит сохранение отчёта в карточке."
+              : "\n\nБот повторит сохранение файлов для поиска. Отметку нужно проверить в карточке выезда.")
             : "\n\nСообщите руководителю: автоматический повтор недоступен.")
       );
     }
@@ -1657,7 +1793,7 @@ async function submitReport(chatId, userId, from) {
       pdfNote = "\n⚠️ PDF-отчёт сформировать не удалось — текст и файлы в чат отправлены.";
     }
 
-    report.sentAt = new Date().toISOString();
+    if (!series) report.sentAt = new Date().toISOString();
 
     // Та же долговечная запись хранит все поля отчёта и задачу публикации проверки.
     // Повтор CRM идемпотентен по report.id, а неоднозначную отправку в Telegram
@@ -1669,7 +1805,9 @@ async function submitReport(chatId, userId, from) {
       if (d.tripCreate) await showIndexResult("Для отметки «Качественно» нужен и предварительный отчёт по этому же выезду.");
     } catch (error) {
       logEvent("error", "Сохранение заключительного отчёта и проверки:", error.message);
-      if (reportOutbox.reportEntry(report.id)) {
+      if (reportOutbox.reportEntry(report.id)?.blocked) {
+        await showIndexResult("⚠️ Состояние назначения изменилось. Передайте руководителю номер выезда для сверки отчёта.");
+      } else if (reportOutbox.reportEntry(report.id)) {
         try { reportOutbox.deferReport(report.id); }
         catch (queueError) { logEvent("error", "Не удалось обновить срок повтора отчёта:", queueError.message); }
         await showIndexResult("⚠️ Фотоотчёт в чате. Бот продолжит сохранять данные и восстанавливать проверку.");
@@ -2334,6 +2472,7 @@ async function handleReportAction(chatId, userId, session, data, from) {
     } else if (key === "create") {
       // Новый выезд: спрашиваем название и задачи, карточка заведётся при отправке отчёта.
       session.data.tripId = null;
+      delete session.data.seriesRevision;
       session.data.tripCreate = true;
       return askNewTripName(chatId, session);
     } else {
@@ -2353,6 +2492,11 @@ async function handleReportAction(chatId, userId, session, data, from) {
       if (t) {
         session.data.tripCreate = false;   // выбрали существующую — новую карточку не создаём
         session.data.tripId = t.id;
+        session.data.seriesRevision = t.seriesRevision || "";
+        if (t.seriesRevision) {
+          session.data.visitDate = t.date;
+          session.data.responsible = t.responsible;
+        }
         session.data.tripName = t.name || "";
         session.data.tripTasks = String(t.comment || "").trim(); // «Задачи на выезд» = поле comment
         session.data.linkedProjectName = String(t.projectName || "").trim();
@@ -2467,6 +2611,9 @@ async function handleReportAction(chatId, userId, session, data, from) {
     return;
   }
 
+  if (data === "series_keep_draft" && session.step === "confirm") {
+    return startReport(chatId, userId, !session.reportWidget, null, true);
+  }
   if (data === "confirm_send" && session.step === "confirm") {
     await submitReport(chatId, userId, from);
     return;

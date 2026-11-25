@@ -16,6 +16,7 @@ function fixture({ profile = { fio: "Сотрудник Стенда" }, failAck
   let session = { step: "idle", data: {}, media: [] };
   const context = vm.createContext({
     BOT_USERNAME: "fixturebot", TARGET_CHAT_ID: "-1000000000011", tripCards: null,
+    reportOutbox: { seriesDraft: () => null },
     bmEnabled: () => true, bmGetProfile: async () => profile, isAllowed: id => id === user.id,
     getSession: () => session, resetSession: () => (session = { step: "idle", data: {}, media: [] }),
     sendTypeMenu: async () => next.push("menu"),

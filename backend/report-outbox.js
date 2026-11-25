@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
 
-const EMPTY = () => ({ version: 1, reports: {}, pendingClaimId: null, deliveries: {}, acks: {} });
+const EMPTY = () => ({ version: 1, reports: {}, series: {}, pendingClaimId: null, deliveries: {}, acks: {} });
 
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -19,10 +19,11 @@ export class ReportOutbox {
       const parsed = JSON.parse(fs.readFileSync(this.filePath, "utf8"));
       if (!isRecord(parsed) || parsed.version !== 1 || !isRecord(parsed.reports)
           || !isRecord(parsed.deliveries) || !isRecord(parsed.acks)
+          || (parsed.series !== undefined && !isRecord(parsed.series))
           || (parsed.pendingClaimId !== null && !/^[a-f0-9]{24}$/.test(parsed.pendingClaimId))) {
         throw new Error("Повреждён файл очереди отчётов: " + this.filePath);
       }
-      this.state = parsed;
+      this.state = { ...parsed, series: parsed.series || {} };
       // A final report may have been interrupted while its PDF was built.
       // Its already copied media still needs to become searchable after restart.
       const staged = Object.values(this.state.reports).filter((entry) => entry.staged);
@@ -64,8 +65,12 @@ export class ReportOutbox {
     this.write(next);
   }
 
+  seriesDraft(owner) { return structuredClone(this.state.series[owner]); }
+  saveSeriesDraft(owner, draft) { this.update(state => { state.series[owner] = structuredClone(draft); }); }
+  removeSeriesDraft(owner) { this.update(state => { delete state.series[owner]; }); }
+
   reportEntries() { return Object.entries(this.state.reports); }
-  queueReport(id, payload, staged = false, review = null) {
+  queueReport(id, payload, staged = false, review = null, seriesOwner = null) {
     this.update((s) => {
       const old = s.reports[id];
       if (old && !old.staged && JSON.stringify(old.payload) !== JSON.stringify(payload)) {
@@ -80,12 +85,13 @@ export class ReportOutbox {
       } else if (!old) {
         s.reports[id] = { payload, staged, retryAt: 0, attempts: 0, ...(review && { review }) };
       }
+      if (seriesOwner) delete s.series[seriesOwner];
     });
   }
   reportEntry(id) { return this.state.reports[id]; }
   hasEarlierFinalIndex(id, tripId) {
     if (!tripId) return false;
-    return this.reportEntries().some(([otherId, entry]) => entry.review && !entry.indexed &&
+    return this.reportEntries().some(([otherId, entry]) => entry.review && !entry.indexed && !entry.blocked &&
       entry.payload.tripId === tripId && Number(otherId.slice(1)) < Number(id.slice(1)));
   }
   recordFinalIndex(id, result) {
@@ -98,10 +104,13 @@ export class ReportOutbox {
   setReviewDelivery(id, status) {
     this.update(s => { s.reports[id].reviewDelivery = status; });
   }
+  blockReport(id, reason) {
+    this.update(state => { if (state.reports[id]) state.reports[id].blocked = reason; });
+  }
   removeReport(id) { this.update((s) => { delete s.reports[id]; }); }
   deferReport(id) {
     this.update((s) => {
-      if (!s.reports[id]) return;
+      if (!s.reports[id] || s.reports[id].blocked) return;
       const entry = s.reports[id];
       entry.attempts = (entry.attempts || 0) + 1;
       entry.retryAt = Date.now() + Math.min(300000, 5000 * 2 ** Math.min(entry.attempts, 6));
